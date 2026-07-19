@@ -75,6 +75,13 @@ export default function PitchProofPage() {
     };
   }, [connectionStatus]);
 
+  // Clean up session on component unmount
+  useEffect(() => {
+    return () => {
+      stopSession('Component unmounted');
+    };
+  }, []);
+
   // Helper to format session duration
   const formatDuration = (seconds: number) => {
     const hrs = Math.floor(seconds / 3600).toString().padStart(2, '0');
@@ -170,20 +177,27 @@ export default function PitchProofPage() {
       };
 
       ws.onmessage = (event) => {
+        // Raw message logging as requested
+        console.log("[PitchProof Client WS Raw Message Received]:", event.data);
         try {
           const msg = JSON.parse(event.data);
           
           if (msg.type === 'status') {
             if (msg.status === 'connected') {
               setConnectionStatus('connected');
-              addLog("Gemini Live API connected and pipeline is streaming!", 'success');
+              addLog(`Gemini Live API connected and pipeline is streaming! (Model: ${msg.model || 'unknown'})`, 'success');
             } else if (msg.status === 'disconnected') {
               setConnectionStatus('disconnected');
-              addLog("Gemini Live API session disconnected.", 'info');
+              const disconnectReason = msg.reason ? ` Reason: ${msg.reason} (Code: ${msg.code || 'N/A'})` : '';
+              addLog(`Gemini Live API session disconnected.${disconnectReason}`, 'info');
+              // Automatically call stopSession to clean up devices and update active state cleanly
+              stopSession(`WebSocket disconnected status received: ${disconnectReason}`, { code: msg.code, reason: msg.reason });
             } else {
               addLog(`Gemini connection state update: ${msg.status}`, 'info');
             }
           } else if (msg.type === 'transcription') {
+            // Log every transcription chunk in the browser console as explicitly requested
+            console.log("[PitchProof Live Transcript Chunk Received]:", msg.text);
             // Append incoming live words continuously
             setTranscript(prev => prev ? prev + " " + msg.text : msg.text);
             addLog(`Live transcription chunk: "${msg.text}"`, 'streaming');
@@ -191,20 +205,25 @@ export default function PitchProofPage() {
             setConnectionStatus('error');
             setErrorMsg(msg.error);
             addLog(`Gemini Live API error: ${msg.error}`, 'error');
-            stopSession();
+            stopSession(`WebSocket reported server-side error: ${msg.error}`, { error: msg.error });
           }
-        } catch (parseErr) {
-          console.error("Failed to parse websocket message:", parseErr);
+        } catch (parseErr: any) {
+          console.error("[PitchProof message-handling error] Failed to parse or process websocket message:", parseErr, parseErr.stack);
+          addLog(`Message handling error: ${parseErr.message || String(parseErr)}`, 'error');
         }
       };
 
       ws.onerror = (e) => {
         setConnectionStatus('error');
         addLog("WebSocket client error encountered.", 'error');
+        console.error("[PitchProof] WebSocket client error:", e);
+        stopSession("WebSocket client error event", { event: e });
       };
 
-      ws.onclose = () => {
-        addLog("Relay WebSocket connection closed.", 'info');
+      ws.onclose = (event) => {
+        console.warn(`[PitchProof] Relay WebSocket onclose event. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
+        addLog(`Relay WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`, 'info');
+        stopSession(`Relay WebSocket closed (Code: ${event.code}, Reason: ${event.reason || 'None'})`, { code: event.code, reason: event.reason });
       };
 
       // 3. Setup Audio Capture Processor
@@ -220,31 +239,48 @@ export default function PitchProofPage() {
       processor.connect(audioCtx.destination);
 
       processor.onaudioprocess = (e) => {
-        if (ws.readyState === WebSocket.OPEN && wsRef.current?.readyState === WebSocket.OPEN) {
-          const rawFloatData = e.inputBuffer.getChannelData(0);
-          const base64PCM = pcmToBase64(rawFloatData);
-          ws.send(JSON.stringify({ type: 'audio', data: base64PCM }));
+        try {
+          if (ws.readyState === WebSocket.OPEN && wsRef.current?.readyState === WebSocket.OPEN) {
+            const rawFloatData = e.inputBuffer.getChannelData(0);
+            const base64PCM = pcmToBase64(rawFloatData);
+            ws.send(JSON.stringify({ type: 'audio', data: base64PCM }));
+          }
+        } catch (audioErr: any) {
+          console.error("[PitchProof Audio Process Error] Error capturing/encoding/sending audio:", audioErr, audioErr.stack);
+          addLog(`Audio processing error: ${audioErr.message || String(audioErr)}`, 'error');
+          stopSession(`Exception during audio capture/processing: ${audioErr.message || String(audioErr)}`, { error: audioErr, stack: audioErr.stack });
         }
       };
 
       setIsSessionActive(true);
 
     } catch (err: any) {
-      console.error("Session startup failure:", err);
+      console.error("Session startup failure:", err, err.stack);
       setConnectionStatus('error');
       setErrorMsg(err.message || String(err));
       addLog(`Failed to start session: ${err.message || String(err)}`, 'error');
-      stopSession();
+      stopSession(`Exception during session startup: ${err.message || String(err)}`, { error: err, stack: err.stack });
     }
   };
 
   // Stop the live session
-  const stopSession = () => {
-    addLog("Stopping live capture and closing active pipelines...", 'info');
+  function stopSession(reason: string = 'User initiated stop', details?: any) {
+    console.warn(`[PitchProof stopSession Triggered] Reason: ${reason}`, {
+      details,
+      stack: new Error().stack
+    });
+    addLog(`Stopping live capture and closing active pipelines... Reason: ${reason}`, 'info');
     
     // Stop all media tracks (camera & microphone)
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+      try {
+        streamRef.current.getTracks().forEach(track => {
+          console.log(`[PitchProof] Stopping media track: ${track.kind} (${track.label})`);
+          track.stop();
+        });
+      } catch (trackErr: any) {
+        console.error("[PitchProof] Error stopping media tracks:", trackErr);
+      }
       streamRef.current = null;
     }
 
@@ -254,21 +290,33 @@ export default function PitchProofPage() {
 
     // Close AudioContext
     if (audioContextRef.current) {
-      if (audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
+      try {
+        if (audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close();
+        }
+      } catch (audioCtxErr: any) {
+        console.error("[PitchProof] Error closing AudioContext:", audioCtxErr);
       }
       audioContextRef.current = null;
     }
 
     if (processorRef.current) {
-      processorRef.current.disconnect();
+      try {
+        processorRef.current.disconnect();
+      } catch (processorErr: any) {
+        console.error("[PitchProof] Error disconnecting processor:", processorErr);
+      }
       processorRef.current = null;
     }
 
     // Close WebSocket
     if (wsRef.current) {
-      if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
-        wsRef.current.close();
+      try {
+        if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+          wsRef.current.close(1000, "Session stopped by request");
+        }
+      } catch (wsCloseErr: any) {
+        console.error("[PitchProof] Error closing client WebSocket:", wsCloseErr);
       }
       wsRef.current = null;
     }
@@ -278,7 +326,7 @@ export default function PitchProofPage() {
       setConnectionStatus('disconnected');
     }
     addLog("Session closed. Final transcript retained on-screen.", 'success');
-  };
+  }
 
   // Toggle Camera
   const toggleCamera = () => {
@@ -557,7 +605,7 @@ export default function PitchProofPage() {
             </button>
           ) : (
             <button
-              onClick={stopSession}
+              onClick={() => stopSession('User clicked Stop Button')}
               className="px-10 py-3.5 bg-red-600 text-white font-bold text-xs uppercase tracking-widest rounded-full shadow-lg shadow-red-200 hover:bg-red-700 hover:shadow-red-300 active:scale-95 flex items-center gap-3 transition-all"
             >
               <div className="w-2.5 h-2.5 rounded-xs bg-white animate-spin"></div>

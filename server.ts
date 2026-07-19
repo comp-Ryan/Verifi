@@ -57,10 +57,11 @@ app.prepare().then(() => {
     
     let session: any = null;
 
-    try {
-      console.log("[Live API] Connecting to Gemini Live API...");
+    // Helper function to establish connection with a specific model
+    const connectSession = async (modelName: string) => {
+      console.log(`[Live API] Connecting to Gemini Live API with model: ${modelName}...`);
       session = await ai.live.connect({
-        model: "gemini-3.1-flash-live-preview",
+        model: modelName,
         config: {
           responseModalities: [Modality.AUDIO],
           systemInstruction: "You are a silent transcriber for PitchProof. Your sole purpose is to capture and transcribe raw microphone input. Never produce vocal audio, speech, or conversational remarks. Maintain absolute silence. The transcription of the founder's pitch is retrieved via the inputAudioTranscription feature.",
@@ -68,52 +69,134 @@ app.prepare().then(() => {
         },
         callbacks: {
           onopen: () => {
-            console.log("[Live API] Connected to Gemini Live session!");
-            clientWs.send(JSON.stringify({ type: "status", status: "connected" }));
+            console.log(`[Live API] Connected to Gemini Live session using model ${modelName}!`);
+            clientWs.send(JSON.stringify({ type: "status", status: "connected", model: modelName }));
           },
-          onclose: () => {
-            console.log("[Live API] Gemini Live session closed.");
-            clientWs.send(JSON.stringify({ type: "status", status: "disconnected" }));
+          onclose: (event?: any) => {
+            const closeCode = event?.code || "N/A";
+            const closeReason = event?.reason || event?.message || "No reason provided";
+            console.warn(`[Live API] Gemini Live session closed for model ${modelName}. Code: ${closeCode}, Reason: ${closeReason}`);
+            clientWs.send(JSON.stringify({ 
+              type: "status", 
+              status: "disconnected", 
+              model: modelName,
+              code: closeCode,
+              reason: closeReason
+            }));
           },
-          onerror: (err) => {
-            console.error("[Live API] Gemini Live session error:", err);
-            clientWs.send(JSON.stringify({ type: "error", error: err.message || String(err) }));
+          onerror: (err: any) => {
+            console.error(`[Live API] Gemini Live session error for model ${modelName}:`, err);
+            clientWs.send(JSON.stringify({ 
+              type: "error", 
+              model: modelName,
+              error: err?.message || String(err),
+              stack: err?.stack || ""
+            }));
           },
           onmessage: (message: any) => {
-            // Log full message for visual debugging in the console
+            // Extensive logging of the exact message structure to identify if transcription format changed
             console.log("[Live API] Message from Gemini:", JSON.stringify(message));
             
-            // Extract input transcription
-            const parts = message.serverContent?.userTurn?.parts;
-            if (parts) {
-              for (const part of parts) {
+            let textFound = false;
+
+            // 1. Check standard path: serverContent -> userTurn -> parts
+            const userParts = message.serverContent?.userTurn?.parts || message.userTurn?.parts;
+            if (userParts && Array.isArray(userParts)) {
+              for (const part of userParts) {
                 if (part.text) {
-                  console.log("[Live API] Transcription fragment received:", part.text);
+                  console.log("[Live API] Found userTurn transcription part:", part.text);
                   clientWs.send(JSON.stringify({ type: "transcription", text: part.text }));
+                  textFound = true;
+                }
+              }
+            }
+
+            // 2. Check modelTurn parts (just in case)
+            if (!textFound) {
+              const modelParts = message.serverContent?.modelTurn?.parts || message.modelTurn?.parts;
+              if (modelParts && Array.isArray(modelParts)) {
+                for (const part of modelParts) {
+                  if (part.text) {
+                    console.log("[Live API] Found modelTurn text part:", part.text);
+                    clientWs.send(JSON.stringify({ type: "transcription", text: part.text }));
+                    textFound = true;
+                  }
+                }
+              }
+            }
+
+            // 3. Fallback: Deep search the message object for any 'text' properties to ensure nothing is missed
+            if (!textFound) {
+              const deepSearchTexts = (obj: any): string[] => {
+                let results: string[] = [];
+                if (!obj || typeof obj !== "object") return results;
+                if (typeof obj.text === "string" && obj.text.trim()) {
+                  // Ignore common config-level instructions or empty strings
+                  const txt = obj.text.trim();
+                  if (!txt.includes("You are a silent transcriber")) {
+                    results.push(txt);
+                  }
+                }
+                for (const key of Object.keys(obj)) {
+                  // Skip system instruction or config keys to avoid false transcription hits
+                  if (key !== "systemInstruction" && key !== "config") {
+                    results = results.concat(deepSearchTexts(obj[key]));
+                  }
+                }
+                return results;
+              };
+
+              const foundTexts = deepSearchTexts(message);
+              if (foundTexts.length > 0) {
+                console.log("[Live API] Deep-search discovered text fragments:", foundTexts);
+                for (const txt of foundTexts) {
+                  clientWs.send(JSON.stringify({ type: "transcription", text: txt }));
                 }
               }
             }
           },
         },
       });
+    };
+
+    // Try starting with primary model and fall back to classic exp model if it fails immediately
+    try {
+      await connectSession("gemini-3.1-flash-live-preview");
     } catch (err: any) {
-      console.error("[Live API] Failed to connect to Gemini Live:", err);
-      clientWs.send(JSON.stringify({ type: "error", error: "Failed to connect to Gemini Live API: " + err.message }));
-      clientWs.close();
-      return;
+      console.warn("[Live API] Primary model (gemini-3.1-flash-live-preview) failed. Attempting fallback (gemini-2.0-flash-exp)...", err);
+      try {
+        await connectSession("gemini-2.0-flash-exp");
+      } catch (fallbackErr: any) {
+        console.error("[Live API] Fallback model also failed to connect:", fallbackErr);
+        clientWs.send(JSON.stringify({ 
+          type: "error", 
+          error: `Failed to connect with both primary and fallback models. Primary error: ${err.message || err}. Fallback error: ${fallbackErr.message || fallbackErr}`
+        }));
+        clientWs.close();
+        return;
+      }
     }
+
+    clientWs.on("error", (wsErr) => {
+      console.error("[Live API] Client WebSocket error:", wsErr);
+    });
 
     clientWs.on("message", async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "audio" && msg.data) {
           if (session) {
-            session.sendRealtimeInput({
-              audio: {
-                data: msg.data, // base64 pcm audio
-                mimeType: "audio/pcm;rate=16000",
-              },
-            });
+            try {
+              session.sendRealtimeInput({
+                audio: {
+                  data: msg.data, // base64 pcm audio
+                  mimeType: "audio/pcm;rate=16000",
+                },
+              });
+            } catch (sendErr: any) {
+              console.error("[Live API] Failed to deliver audio frame to Gemini session:", sendErr);
+              clientWs.send(JSON.stringify({ type: "error", error: "Failed to stream audio to Gemini: " + sendErr.message }));
+            }
           }
         }
       } catch (err) {
