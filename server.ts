@@ -220,21 +220,26 @@ app.prepare().then(() => {
       });
     };
 
-    // Try starting with primary model
+    // Try starting with primary model and fallback to exp model if it fails immediately
     try {
-      await connectSession("gemini-3.1-flash-live-preview");
+      await connectSession("gemini-2.0-flash");
     } catch (err: any) {
-      console.error("[Live API] Failed to connect to Gemini Live session using primary model:", err);
-      safeSend({ 
-        type: "error", 
-        error: `Failed to connect with primary model gemini-3.1-flash-live-preview. Error: ${err.message || err}`
-      });
+      console.warn("[Live API] Primary model (gemini-2.0-flash) failed. Attempting fallback (gemini-2.0-flash-exp)...", err);
       try {
-        clientWs.close();
-      } catch (wsCloseErr) {
-        console.error("[Live API] Error closing client ws after failed connection:", wsCloseErr);
+        await connectSession("gemini-2.0-flash-exp");
+      } catch (fallbackErr: any) {
+        console.error("[Live API] Fallback model also failed to connect:", fallbackErr);
+        safeSend({ 
+          type: "error", 
+          error: `Failed to connect with both primary and fallback models. Primary error: ${err.message || err}. Fallback error: ${fallbackErr.message || fallbackErr}`
+        });
+        try {
+          clientWs.close();
+        } catch (wsCloseErr) {
+          console.error("[Live API] Error closing client ws after failed connection:", wsCloseErr);
+        }
+        return;
       }
-      return;
     }
 
     clientWs.on("error", (wsErr) => {
