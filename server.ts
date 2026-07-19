@@ -4,6 +4,8 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { GoogleGenAI, Modality } from "@google/genai";
 import { loadEnvConfig } from '@next/env';
+import fs from 'fs';
+import path from 'path';
 
 // Load environment variables from .env / .env.local
 loadEnvConfig(process.cwd());
@@ -19,6 +21,21 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const port = parseInt(process.env.PORT || '3000', 10);
 const dev = process.env.NODE_ENV !== 'production';
+
+// If running in development mode, delete any existing production `.next` build directory
+// to prevent development/production manifest mismatches (e.g., SegmentViewNode or 833.js errors).
+if (dev) {
+  const nextDir = path.join(process.cwd(), '.next');
+  if (fs.existsSync(nextDir)) {
+    console.log("[Dev Server] Removing production build directory (.next) to prevent development/production manifest mismatch...");
+    try {
+      fs.rmSync(nextDir, { recursive: true, force: true });
+    } catch (err) {
+      console.error("[Dev Server] Error removing .next directory:", err);
+    }
+  }
+}
+
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
@@ -160,57 +177,10 @@ app.prepare().then(() => {
               // Extensive logging of the exact message structure as requested
               console.log("[Live API] Message from Gemini:", JSON.stringify(message));
               
-              let textFound = false;
-
-              // 1. Check exact inputAudioTranscription path (main user speech transcription path)
-              const inputParts = message.serverContent?.inputTranscription?.parts || message.inputTranscription?.parts;
-              if (inputParts && Array.isArray(inputParts)) {
-                for (const part of inputParts) {
-                  if (part.text) {
-                    console.log("[Live API] Found inputTranscription part:", part.text);
-                    safeSend({ type: "transcription", text: part.text });
-                    textFound = true;
-                  }
-                }
-              }
-
-              // 2. Check standard path: serverContent -> userTurn -> parts
-              if (!textFound) {
-                const userParts = message.serverContent?.userTurn?.parts || message.userTurn?.parts;
-                if (userParts && Array.isArray(userParts)) {
-                  for (const part of userParts) {
-                    if (part.text) {
-                      console.log("[Live API] Found userTurn transcription part:", part.text);
-                      safeSend({ type: "transcription", text: part.text });
-                      textFound = true;
-                    }
-                  }
-                }
-              }
-
-              // 3. Check modelTurn parts
-              if (!textFound) {
-                const modelParts = message.serverContent?.modelTurn?.parts || message.modelTurn?.parts;
-                if (modelParts && Array.isArray(modelParts)) {
-                  for (const part of modelParts) {
-                    if (part.text) {
-                      console.log("[Live API] Found modelTurn text part:", part.text);
-                      safeSend({ type: "transcription", text: part.text });
-                      textFound = true;
-                    }
-                  }
-                }
-              }
-
-              // 4. Fallback: Safe depth-limited, circular-safe deep search
-              if (!textFound) {
-                const foundTexts = safeDeepSearch(message);
-                if (foundTexts.length > 0) {
-                  console.log("[Live API] Safe deep-search discovered text fragments:", foundTexts);
-                  for (const txt of foundTexts) {
-                    safeSend({ type: "transcription", text: txt });
-                  }
-                }
+              const userText = message.serverContent?.inputTranscription?.text;
+              if (userText && typeof userText === "string" && userText.trim()) {
+                console.log("[Live API] Found user input transcription:", userText);
+                safeSend({ type: "transcription", text: userText });
               }
             } catch (msgErr: any) {
               console.error("[Live API] Error in onmessage callback:", msgErr, msgErr.stack);
