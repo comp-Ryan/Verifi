@@ -8,6 +8,15 @@ import { loadEnvConfig } from '@next/env';
 // Load environment variables from .env / .env.local
 loadEnvConfig(process.cwd());
 
+// Top-level process safety net to prevent server crashes
+process.on('uncaughtException', (err) => {
+  console.error("[Process safety net] Uncaught Exception caught:", err, err?.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error("[Process safety net] Unhandled Rejection at:", promise, "reason:", reason);
+});
+
 const port = parseInt(process.env.PORT || '3000', 10);
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
@@ -53,9 +62,50 @@ app.prepare().then(() => {
   // Handle WebSocket connections
   wss.on('connection', async (clientWs) => {
     console.log("[Live API] Client connected to live-ws");
-    clientWs.send(JSON.stringify({ type: "status", status: "connecting" }));
+    
+    // Helper to safely send messages over client WebSocket without throwing
+    const safeSend = (payload: any) => {
+      try {
+        if (clientWs && clientWs.readyState === 1) { // 1 is WebSocket.OPEN
+          clientWs.send(JSON.stringify(payload));
+        } else {
+          console.warn("[Live API] Could not send message, client WebSocket is not in OPEN state:", clientWs?.readyState);
+        }
+      } catch (err) {
+        console.error("[Live API] Error in safeSend:", err);
+      }
+    };
+
+    safeSend({ type: "status", status: "connecting" });
     
     let session: any = null;
+
+    // Safe depth-limited, circular-safe deep search for 'text' properties to prevent stack overflows/circular reference crashes
+    const safeDeepSearch = (obj: any, depth: number = 0, visited = new Set<any>()): string[] => {
+      let results: string[] = [];
+      if (!obj || typeof obj !== "object" || depth > 8 || visited.has(obj)) {
+        return results;
+      }
+      visited.add(obj);
+
+      try {
+        if (typeof obj.text === "string" && obj.text.trim()) {
+          const txt = obj.text.trim();
+          if (!txt.includes("You are a silent transcriber")) {
+            results.push(txt);
+          }
+        }
+        
+        for (const key of Object.keys(obj)) {
+          if (key !== "systemInstruction" && key !== "config") {
+            results = results.concat(safeDeepSearch(obj[key], depth + 1, visited));
+          }
+        }
+      } catch (e) {
+        console.error("[Live API] Error in safeDeepSearch helper:", e);
+      }
+      return results;
+    };
 
     // Helper function to establish connection with a specific model
     const connectSession = async (modelName: string) => {
@@ -69,116 +119,130 @@ app.prepare().then(() => {
         },
         callbacks: {
           onopen: () => {
-            console.log(`[Live API] Connected to Gemini Live session using model ${modelName}!`);
-            clientWs.send(JSON.stringify({ type: "status", status: "connected", model: modelName }));
+            try {
+              console.log(`[Live API] Connected to Gemini Live session using model ${modelName}!`);
+              safeSend({ type: "status", status: "connected", model: modelName });
+            } catch (err) {
+              console.error("[Live API] Error in onopen callback:", err);
+            }
           },
           onclose: (event?: any) => {
-            const closeCode = event?.code || "N/A";
-            const closeReason = event?.reason || event?.message || "No reason provided";
-            console.warn(`[Live API] Gemini Live session closed for model ${modelName}. Code: ${closeCode}, Reason: ${closeReason}`);
-            clientWs.send(JSON.stringify({ 
-              type: "status", 
-              status: "disconnected", 
-              model: modelName,
-              code: closeCode,
-              reason: closeReason
-            }));
+            try {
+              const closeCode = event?.code || "N/A";
+              const closeReason = event?.reason || event?.message || "No reason provided";
+              console.warn(`[Live API] Gemini Live session closed for model ${modelName}. Code: ${closeCode}, Reason: ${closeReason}`);
+              safeSend({ 
+                type: "status", 
+                status: "disconnected", 
+                model: modelName,
+                code: closeCode,
+                reason: closeReason
+              });
+            } catch (err) {
+              console.error("[Live API] Error in onclose callback:", err);
+            }
           },
           onerror: (err: any) => {
-            console.error(`[Live API] Gemini Live session error for model ${modelName}:`, err);
-            clientWs.send(JSON.stringify({ 
-              type: "error", 
-              model: modelName,
-              error: err?.message || String(err),
-              stack: err?.stack || ""
-            }));
+            try {
+              console.error(`[Live API] Gemini Live session error for model ${modelName}:`, err);
+              safeSend({ 
+                type: "error", 
+                model: modelName,
+                error: err?.message || String(err),
+                stack: err?.stack || ""
+              });
+            } catch (cbErr) {
+              console.error("[Live API] Error in onerror callback:", cbErr);
+            }
           },
           onmessage: (message: any) => {
-            // Extensive logging of the exact message structure to identify if transcription format changed
-            console.log("[Live API] Message from Gemini:", JSON.stringify(message));
-            
-            let textFound = false;
+            try {
+              // Extensive logging of the exact message structure as requested
+              console.log("[Live API] Message from Gemini:", JSON.stringify(message));
+              
+              let textFound = false;
 
-            // 1. Check standard path: serverContent -> userTurn -> parts
-            const userParts = message.serverContent?.userTurn?.parts || message.userTurn?.parts;
-            if (userParts && Array.isArray(userParts)) {
-              for (const part of userParts) {
-                if (part.text) {
-                  console.log("[Live API] Found userTurn transcription part:", part.text);
-                  clientWs.send(JSON.stringify({ type: "transcription", text: part.text }));
-                  textFound = true;
-                }
-              }
-            }
-
-            // 2. Check modelTurn parts (just in case)
-            if (!textFound) {
-              const modelParts = message.serverContent?.modelTurn?.parts || message.modelTurn?.parts;
-              if (modelParts && Array.isArray(modelParts)) {
-                for (const part of modelParts) {
+              // 1. Check exact inputAudioTranscription path (main user speech transcription path)
+              const inputParts = message.serverContent?.inputTranscription?.parts || message.inputTranscription?.parts;
+              if (inputParts && Array.isArray(inputParts)) {
+                for (const part of inputParts) {
                   if (part.text) {
-                    console.log("[Live API] Found modelTurn text part:", part.text);
-                    clientWs.send(JSON.stringify({ type: "transcription", text: part.text }));
+                    console.log("[Live API] Found inputTranscription part:", part.text);
+                    safeSend({ type: "transcription", text: part.text });
                     textFound = true;
                   }
                 }
               }
-            }
 
-            // 3. Fallback: Deep search the message object for any 'text' properties to ensure nothing is missed
-            if (!textFound) {
-              const deepSearchTexts = (obj: any): string[] => {
-                let results: string[] = [];
-                if (!obj || typeof obj !== "object") return results;
-                if (typeof obj.text === "string" && obj.text.trim()) {
-                  // Ignore common config-level instructions or empty strings
-                  const txt = obj.text.trim();
-                  if (!txt.includes("You are a silent transcriber")) {
-                    results.push(txt);
+              // 2. Check standard path: serverContent -> userTurn -> parts
+              if (!textFound) {
+                const userParts = message.serverContent?.userTurn?.parts || message.userTurn?.parts;
+                if (userParts && Array.isArray(userParts)) {
+                  for (const part of userParts) {
+                    if (part.text) {
+                      console.log("[Live API] Found userTurn transcription part:", part.text);
+                      safeSend({ type: "transcription", text: part.text });
+                      textFound = true;
+                    }
                   }
-                }
-                for (const key of Object.keys(obj)) {
-                  // Skip system instruction or config keys to avoid false transcription hits
-                  if (key !== "systemInstruction" && key !== "config") {
-                    results = results.concat(deepSearchTexts(obj[key]));
-                  }
-                }
-                return results;
-              };
-
-              const foundTexts = deepSearchTexts(message);
-              if (foundTexts.length > 0) {
-                console.log("[Live API] Deep-search discovered text fragments:", foundTexts);
-                for (const txt of foundTexts) {
-                  clientWs.send(JSON.stringify({ type: "transcription", text: txt }));
                 }
               }
+
+              // 3. Check modelTurn parts
+              if (!textFound) {
+                const modelParts = message.serverContent?.modelTurn?.parts || message.modelTurn?.parts;
+                if (modelParts && Array.isArray(modelParts)) {
+                  for (const part of modelParts) {
+                    if (part.text) {
+                      console.log("[Live API] Found modelTurn text part:", part.text);
+                      safeSend({ type: "transcription", text: part.text });
+                      textFound = true;
+                    }
+                  }
+                }
+              }
+
+              // 4. Fallback: Safe depth-limited, circular-safe deep search
+              if (!textFound) {
+                const foundTexts = safeDeepSearch(message);
+                if (foundTexts.length > 0) {
+                  console.log("[Live API] Safe deep-search discovered text fragments:", foundTexts);
+                  for (const txt of foundTexts) {
+                    safeSend({ type: "transcription", text: txt });
+                  }
+                }
+              }
+            } catch (msgErr: any) {
+              console.error("[Live API] Error in onmessage callback:", msgErr, msgErr.stack);
             }
           },
         },
       });
     };
 
-    // Try starting with primary model and fall back to classic exp model if it fails immediately
+    // Try starting with primary model
     try {
       await connectSession("gemini-3.1-flash-live-preview");
     } catch (err: any) {
-      console.warn("[Live API] Primary model (gemini-3.1-flash-live-preview) failed. Attempting fallback (gemini-2.0-flash-exp)...", err);
+      console.error("[Live API] Failed to connect to Gemini Live session using primary model:", err);
+      safeSend({ 
+        type: "error", 
+        error: `Failed to connect with primary model gemini-3.1-flash-live-preview. Error: ${err.message || err}`
+      });
       try {
-        await connectSession("gemini-2.0-flash-exp");
-      } catch (fallbackErr: any) {
-        console.error("[Live API] Fallback model also failed to connect:", fallbackErr);
-        clientWs.send(JSON.stringify({ 
-          type: "error", 
-          error: `Failed to connect with both primary and fallback models. Primary error: ${err.message || err}. Fallback error: ${fallbackErr.message || fallbackErr}`
-        }));
         clientWs.close();
-        return;
+      } catch (wsCloseErr) {
+        console.error("[Live API] Error closing client ws after failed connection:", wsCloseErr);
       }
+      return;
     }
 
     clientWs.on("error", (wsErr) => {
-      console.error("[Live API] Client WebSocket error:", wsErr);
+      try {
+        console.error("[Live API] Client WebSocket error:", wsErr);
+      } catch (e) {
+        console.error("[Live API] Error in clientWs error handler:", e);
+      }
     });
 
     clientWs.on("message", async (data) => {
@@ -195,7 +259,7 @@ app.prepare().then(() => {
               });
             } catch (sendErr: any) {
               console.error("[Live API] Failed to deliver audio frame to Gemini session:", sendErr);
-              clientWs.send(JSON.stringify({ type: "error", error: "Failed to stream audio to Gemini: " + sendErr.message }));
+              safeSend({ type: "error", error: "Failed to stream audio to Gemini: " + sendErr.message });
             }
           }
         }
@@ -205,13 +269,17 @@ app.prepare().then(() => {
     });
 
     clientWs.on("close", () => {
-      console.log("[Live API] Client disconnected from live-ws");
-      if (session) {
-        try {
-          session.close();
-        } catch (e) {
-          console.error("[Live API] Error closing Gemini session:", e);
+      try {
+        console.log("[Live API] Client disconnected from live-ws");
+        if (session) {
+          try {
+            session.close();
+          } catch (e) {
+            console.error("[Live API] Error closing Gemini session:", e);
+          }
         }
+      } catch (err) {
+        console.error("[Live API] Error in clientWs close handler:", err);
       }
     });
   });
