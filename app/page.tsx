@@ -112,7 +112,7 @@ interface VerificationResult {
   sources: { title: string; url: string }[];
 }
 
-export default function PitchProofPage() {
+export default function VerifiPage() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   const [transcript, setTranscript] = useState<string>('');
@@ -168,10 +168,10 @@ export default function PitchProofPage() {
         throw new Error(errorDetail);
       }
       const data = await resp.json();
-      console.log('[PitchProof Verify]', { id, sentence, ...data });
+      console.log('[Verifi Verify]', { id, sentence, ...data });
       setVerifications(prev => ({ ...prev, [id]: data }));
     } catch (err: any) {
-      console.error('[PitchProof Verify] failed:', err);
+      console.error('[Verifi Verify] failed:', err);
       const errMsg = err?.message || String(err);
       const isRateLimit = errMsg.includes('429') || 
                           errMsg.toLowerCase().includes('quota') || 
@@ -247,7 +247,7 @@ export default function PitchProofPage() {
         sentence: item.sentence,
         isCheckable: item.isCheckable
       }));
-      console.log("[PitchProof ClaimFilter] Current Claims:", JSON.stringify(logArray));
+      console.log("[Verifi ClaimFilter] Current Claims:", JSON.stringify(logArray));
       return updated;
     });
   };
@@ -326,7 +326,7 @@ export default function PitchProofPage() {
     setLogs(prev => [newLog, ...prev].slice(0, 50)); // Keep last 50 logs
     
     // Console logging format for user audit as explicitly requested
-    console.log(`%c[PitchProof][${timestamp}] ${message}`, `color: ${type === 'success' ? '#10B981' : type === 'error' ? '#EF4444' : type === 'streaming' ? '#06B6D4' : '#6B7280'}`);
+    console.log(`%c[Verifi][${timestamp}] ${message}`, `color: ${type === 'success' ? '#10B981' : type === 'error' ? '#EF4444' : type === 'streaming' ? '#06B6D4' : '#6B7280'}`);
   };
 
   // Convert 32-bit floats to 16-bit signed PCM little-endian, then encode to base64
@@ -373,7 +373,7 @@ export default function PitchProofPage() {
           wsRef.current.onclose = null;
           wsRef.current.close();
         } catch (wsErr) {
-          console.error("[PitchProof] Error closing WS during retry backoff:", wsErr);
+          console.error("[Verifi] Error closing WS during retry backoff:", wsErr);
         }
         wsRef.current = null;
       }
@@ -407,7 +407,7 @@ export default function PitchProofPage() {
         wsRef.current.onclose = null;
         wsRef.current.close();
       } catch (wsErr) {
-        console.error("[PitchProof] Error clearing old WS:", wsErr);
+        console.error("[Verifi] Error clearing old WS:", wsErr);
       }
       wsRef.current = null;
     }
@@ -427,7 +427,7 @@ export default function PitchProofPage() {
     };
 
     ws.onmessage = (event) => {
-      console.log("[PitchProof Client WS Raw Message Received]:", event.data);
+      console.log("[Verifi Client WS Raw Message Received]:", event.data);
       try {
         const msg = JSON.parse(event.data);
 
@@ -447,7 +447,7 @@ export default function PitchProofPage() {
             addLog(`Gemini connection state update: ${msg.status}`, 'info');
           }
         } else if (msg.type === 'transcription') {
-          console.log("[PitchProof Live Transcript Chunk Received]:", msg.text);
+          console.log("[Verifi Live Transcript Chunk Received]:", msg.text);
           setTranscript(prev => prev ? prev + " " + msg.text : msg.text);
           addLog(`Live transcription chunk: "${msg.text}"`, 'streaming');
 
@@ -492,7 +492,7 @@ export default function PitchProofPage() {
           }
         }
       } catch (parseErr: any) {
-        console.error("[PitchProof message-handling error] Failed to parse or process websocket message:", parseErr, parseErr.stack);
+        console.error("[Verifi message-handling error] Failed to parse or process websocket message:", parseErr, parseErr.stack);
         addLog(`Message handling error: ${parseErr.message || String(parseErr)}`, 'error');
       }
     };
@@ -500,12 +500,12 @@ export default function PitchProofPage() {
     ws.onerror = (e) => {
       // Log WebSocket client connection error.
       // We don't immediately call retry here because onclose is guaranteed to trigger next.
-      console.error("[PitchProof] Relay WebSocket client onerror:", e);
+      console.error("[Verifi] Relay WebSocket client onerror:", e);
       addLog("Relay WebSocket connection error encountered.", 'error');
     };
 
     ws.onclose = (event) => {
-      console.warn(`[PitchProof] Relay WebSocket onclose event. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
+      console.warn(`[Verifi] Relay WebSocket onclose event. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
       addLog(`Relay WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`, 'info');
       
       // Let's retry unless it was a clean close or user stopped the session
@@ -587,7 +587,7 @@ export default function PitchProofPage() {
             wsRef.current.send(JSON.stringify({ type: 'audio', data: base64PCM }));
           }
         } catch (audioErr: any) {
-          console.error("[PitchProof Audio Process Error] Error capturing/encoding/sending audio:", audioErr, audioErr.stack);
+          console.error("[Verifi Audio Process Error] Error capturing/encoding/sending audio:", audioErr, audioErr.stack);
           addLog(`Audio processing error: ${audioErr.message || String(audioErr)}`, 'error');
           handleDisconnectOrFailure(`Audio processing exception: ${audioErr.message || String(audioErr)}`);
         }
@@ -607,7 +607,7 @@ export default function PitchProofPage() {
 
   // Stop the live session
   function stopSession(reason: string = 'User initiated stop', details?: any) {
-    console.warn(`[PitchProof stopSession Triggered] Reason: ${reason}`, {
+    console.warn(`[Verifi stopSession Triggered] Reason: ${reason}`, {
       details,
       stack: new Error().stack
     });
@@ -633,11 +633,11 @@ export default function PitchProofPage() {
     if (streamRef.current) {
       try {
         streamRef.current.getTracks().forEach(track => {
-          console.log(`[PitchProof] Stopping media track: ${track.kind} (${track.label})`);
+          console.log(`[Verifi] Stopping media track: ${track.kind} (${track.label})`);
           track.stop();
         });
       } catch (trackErr: any) {
-        console.error("[PitchProof] Error stopping media tracks:", trackErr);
+        console.error("[Verifi] Error stopping media tracks:", trackErr);
       }
       streamRef.current = null;
     }
@@ -653,7 +653,7 @@ export default function PitchProofPage() {
           audioContextRef.current.close();
         }
       } catch (audioCtxErr: any) {
-        console.error("[PitchProof] Error closing AudioContext:", audioCtxErr);
+        console.error("[Verifi] Error closing AudioContext:", audioCtxErr);
       }
       audioContextRef.current = null;
     }
@@ -662,7 +662,7 @@ export default function PitchProofPage() {
       try {
         processorRef.current.disconnect();
       } catch (processorErr: any) {
-        console.error("[PitchProof] Error disconnecting processor:", processorErr);
+        console.error("[Verifi] Error disconnecting processor:", processorErr);
       }
       processorRef.current = null;
     }
@@ -678,7 +678,7 @@ export default function PitchProofPage() {
           wsRef.current.close(1000, "Session stopped by request");
         }
       } catch (wsCloseErr: any) {
-        console.error("[PitchProof] Error closing client WebSocket:", wsCloseErr);
+        console.error("[Verifi] Error closing client WebSocket:", wsCloseErr);
       }
       wsRef.current = null;
     }
@@ -721,12 +721,12 @@ export default function PitchProofPage() {
     setVerifications({});
     autoVerifyCountRef.current = 0;
     verifyQueueRef.current = [];
-    console.log("[PitchProof ClaimFilter] Claims cleared.");
+    console.log("[Verifi ClaimFilter] Claims cleared.");
     addLog("Transcript and claims cleared.", 'info');
   };
 
   return (
-    <div className="h-full min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 overflow-x-hidden selection:bg-indigo-100 selection:text-indigo-950" id="pitchproof-root">
+    <div className="h-full min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 overflow-x-hidden selection:bg-indigo-100 selection:text-indigo-950" id="verifi-root">
       {/* Top Header Navigation */}
       <header className="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-6 sm:px-8 shrink-0 sticky top-0 z-30">
         <div className="flex items-center gap-3">
@@ -735,7 +735,7 @@ export default function PitchProofPage() {
             <div className="w-4 h-4 border-2 border-white rounded-sm rotate-45 transition-transform duration-1000 ease-in-out hover:rotate-90"></div>
           </div>
           <h1 className="text-xl font-bold tracking-tight text-slate-800 flex items-center">
-            PitchProof 
+            Verifi 
             <span className="text-[10px] font-bold tracking-widest text-slate-400 bg-slate-100 border border-slate-200 uppercase px-2 py-0.5 rounded ml-3">
               V1.0 LIVE
             </span>

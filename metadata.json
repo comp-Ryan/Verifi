@@ -1,5 +1,5 @@
 {
-  "name": "PitchProof",
+  "name": "Verifi",
   "description": "A live diligence tool that listens to a founder's pitch and transcribes it in real-time using the Gemini Live API.",
   "requestFramePermissions": ["camera", "microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

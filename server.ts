@@ -205,7 +205,7 @@ contradict them.`
         model: modelName,
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: "You are a silent transcriber for PitchProof. Your sole purpose is to capture and transcribe raw microphone input. Never produce vocal audio, speech, or conversational remarks. Maintain absolute silence. The transcription of the founder's pitch is retrieved via the inputAudioTranscription feature.",
+          systemInstruction: "You are a silent transcriber for Verifi. Your sole purpose is to capture and transcribe raw microphone input. Never produce vocal audio, speech, or conversational remarks. Maintain absolute silence. The transcription of the founder's pitch is retrieved via the inputAudioTranscription feature.",
           inputAudioTranscription: {},
         },
         callbacks: {
