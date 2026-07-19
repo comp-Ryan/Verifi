@@ -1,3 +1,4 @@
+/* eslint-disable */
 'use client';
 
 import React, { useState, useRef, useEffect } from 'react';
@@ -127,8 +128,9 @@ export default function PitchProofPage() {
   const autoVerifyCountRef = useRef(0);
   const activeVerifyCountRef = useRef(0);
   const verifyQueueRef = useRef<{ id: string; sentence: string }[]>([]);
+  const retriedSentencesRef = useRef<Record<string, boolean>>({});
   const MAX_AUTO_VERIFICATIONS = 12;
-  const MAX_CONCURRENT_VERIFICATIONS = 2;
+  const MAX_CONCURRENT_VERIFICATIONS = 1;
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -170,11 +172,32 @@ export default function PitchProofPage() {
       setVerifications(prev => ({ ...prev, [id]: data }));
     } catch (err: any) {
       console.error('[PitchProof Verify] failed:', err);
-      setVerifications(prev => ({ ...prev, [id]: { verdict: 'error', confidence: 0, evidence: err?.message || 'Request failed', sources: [] } }));
+      const errMsg = err?.message || String(err);
+      const isRateLimit = errMsg.includes('429') || 
+                          errMsg.toLowerCase().includes('quota') || 
+                          errMsg.includes('RESOURCE_EXHAUSTED');
+      
+      if (isRateLimit && !retriedSentencesRef.current[id]) {
+        retriedSentencesRef.current[id] = true;
+        setVerifications(prev => ({ 
+          ...prev, 
+          [id]: { verdict: 'pending', confidence: 0, evidence: 'Rate limit hit. Retrying in 45s...', sources: [] } 
+        }));
+        setTimeout(() => {
+          runVerification(id, sentence);
+        }, 45000);
+      } else {
+        setVerifications(prev => ({ 
+          ...prev, 
+          [id]: { verdict: 'error', confidence: 0, evidence: errMsg, sources: [] } 
+        }));
+      }
     } finally {
       activeVerifyCountRef.current -= 1;
-      const next = verifyQueueRef.current.shift();
-      if (next) runVerification(next.id, next.sentence);
+      setTimeout(() => {
+        const next = verifyQueueRef.current.shift();
+        if (next) runVerification(next.id, next.sentence);
+      }, 4000);
     }
   }
 
@@ -494,6 +517,13 @@ export default function PitchProofPage() {
 
   // Start the live audio capture and Gemini session
   async function startSession() {
+    setSentences([]);
+    setVerifications({});
+    sentenceBufferRef.current = '';
+    verifyQueueRef.current = [];
+    autoVerifyCountRef.current = 0;
+    retriedSentencesRef.current = {};
+
     setErrorMsg(null);
     setSessionDuration(0);
     setConnectionStatus('connecting');

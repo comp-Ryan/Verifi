@@ -109,7 +109,9 @@ contradict them.`
       });
     } catch (err: any) {
       console.error('[Verify] Endpoint error:', err);
-      return res.status(500).json({ error: 'Verification failed', detail: err?.message || String(err) });
+      const errMsg = err?.message || String(err);
+      const isRateLimit = errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED');
+      return res.status(isRateLimit ? 429 : 500).json({ error: 'Verification failed', detail: errMsg });
     }
   });
 
