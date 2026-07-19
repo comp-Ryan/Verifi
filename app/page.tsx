@@ -30,6 +30,75 @@ interface LogEntry {
   message: string;
 }
 
+// Case-insensitive wordlists for Tier 1 claim-filtering heuristics
+const CLAIM_KEYWORDS = {
+  superlatives: [
+    "only", "first", "best", "biggest", "largest", "fastest", "leading", 
+    "no one else", "never been done"
+  ],
+  competitorMarkers: [
+    "competitor", "unlike", "compared to"
+  ],
+  traction: [
+    "users", "customers", "revenue", "arr", "mrr", "growth", 
+    "market size", "tam", "retention", "churn", "signed", 
+    "partnership", "funding", "raised"
+  ],
+  largeNumbers: [
+    "million", "billion", "thousand"
+  ]
+};
+
+// Checkable claim helper function utilizing simple, robust regular expressions
+const checkSentenceIsCheckable = (sentence: string): boolean => {
+  const lower = sentence.toLowerCase();
+
+  // 1. Check for digits, percentages, or dollar/money symbols
+  if (/[\d$%]/.test(sentence)) {
+    return true;
+  }
+
+  // Word boundary regex matching helper
+  const matchesWholeWord = (text: string, words: string[]): boolean => {
+    return words.some(word => {
+      const escaped = word.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const regex = new RegExp(`\\b${escaped}\\b`, 'i');
+      return regex.test(text);
+    });
+  };
+
+  // 2. Superlatives, Exclusivities
+  if (matchesWholeWord(lower, CLAIM_KEYWORDS.superlatives)) {
+    return true;
+  }
+
+  // 3. Spelled-out large numbers
+  if (matchesWholeWord(lower, CLAIM_KEYWORDS.largeNumbers)) {
+    return true;
+  }
+
+  // 4. Traction or market-size markers
+  if (matchesWholeWord(lower, CLAIM_KEYWORDS.traction)) {
+    return true;
+  }
+
+  // 5. Competitor relative positioning markers
+  if (matchesWholeWord(lower, CLAIM_KEYWORDS.competitorMarkers)) {
+    return true;
+  }
+
+  // 6. Capitalized multi-word proper nouns that are not sentence-initial
+  const properNounRegex = /\b[A-Z][a-zA-Z0-9']*(?:\s+[A-Z][a-zA-Z0-9']*)+\b/g;
+  let properNounMatch;
+  while ((properNounMatch = properNounRegex.exec(sentence)) !== null) {
+    if (properNounMatch.index > 0) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 export default function PitchProofPage() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
@@ -39,6 +108,7 @@ export default function PitchProofPage() {
   const [cameraActive, setCameraActive] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionDuration, setSessionDuration] = useState(0);
+  const [sentences, setSentences] = useState<{ id: string; sentence: string; isCheckable: boolean }[]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -46,11 +116,15 @@ export default function PitchProofPage() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const sentencesEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const retryCountRef = useRef<number>(0);
   const isSessionActiveRef = useRef<boolean>(false);
   const maxRetries = 3;
+
+  const sentenceBufferRef = useRef<string>('');
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Auto-scroll transcript to bottom as new words arrive
   useEffect(() => {
@@ -58,6 +132,57 @@ export default function PitchProofPage() {
       transcriptEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [transcript]);
+
+  // Auto-scroll segmented sentences to bottom as new claims/segments arrive
+  useEffect(() => {
+    if (sentencesEndRef.current) {
+      sentencesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [sentences]);
+
+  const addSentence = (rawSentence: string) => {
+    const sentence = rawSentence.trim();
+    if (!sentence) return;
+
+    const isCheckable = checkSentenceIsCheckable(sentence);
+    const newId = Math.random().toString(36).substring(2, 9);
+    
+    setSentences(prev => {
+      const updated = [...prev, { id: newId, sentence, isCheckable }];
+      const logArray = updated.map(item => ({
+        sentence: item.sentence,
+        isCheckable: item.isCheckable
+      }));
+      console.log("[PitchProof ClaimFilter] Current Claims:", JSON.stringify(logArray));
+      return updated;
+    });
+  };
+
+  const processSentenceBuffer = (isFlush = false) => {
+    const text = sentenceBufferRef.current.trim();
+    if (!text) return;
+
+    if (isFlush) {
+      addSentence(text);
+      sentenceBufferRef.current = '';
+      return;
+    }
+
+    const regex = /([^.!?]*[.!?]+)/g;
+    let match;
+    let lastIndex = 0;
+    const matches: string[] = [];
+    
+    while ((match = regex.exec(text)) !== null) {
+      matches.push(match[1]);
+      lastIndex = regex.lastIndex;
+    }
+    
+    if (matches.length > 0) {
+      matches.forEach(s => addSentence(s));
+      sentenceBufferRef.current = text.slice(lastIndex).trim();
+    }
+  };
 
   // Session Duration Timer
   useEffect(() => {
@@ -84,6 +209,7 @@ export default function PitchProofPage() {
     return () => {
       stopSession('Component unmounted');
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Helper to format session duration
@@ -230,6 +356,25 @@ export default function PitchProofPage() {
           console.log("[PitchProof Live Transcript Chunk Received]:", msg.text);
           setTranscript(prev => prev ? prev + " " + msg.text : msg.text);
           addLog(`Live transcription chunk: "${msg.text}"`, 'streaming');
+
+          // Append chunk to the active sentence buffer
+          sentenceBufferRef.current += (sentenceBufferRef.current ? " " : "") + msg.text;
+
+          // Clear any active silence timer
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+
+          // Process the buffer for complete punctuated sentences
+          processSentenceBuffer(false);
+
+          // Reset the silence gap timer (750ms silence gap)
+          silenceTimerRef.current = setTimeout(() => {
+            if (sentenceBufferRef.current.trim()) {
+              processSentenceBuffer(true); // Force flush sentence on silence gap
+            }
+          }, 750);
         } else if (msg.type === 'error') {
           addLog(`Gemini Live API inner error message received: ${msg.error}`, 'error');
           
@@ -367,6 +512,15 @@ export default function PitchProofPage() {
     });
     addLog(`Stopping live capture and closing active pipelines... Reason: ${reason}`, 'info');
     
+    // Clear silence timer and flush any remaining buffer
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (sentenceBufferRef.current.trim()) {
+      processSentenceBuffer(true);
+    }
+
     // Clear any reconnect timeouts
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
@@ -461,7 +615,10 @@ export default function PitchProofPage() {
       return;
     }
     setTranscript('');
-    addLog("Transcript cleared.", 'info');
+    setSentences([]);
+    sentenceBufferRef.current = '';
+    console.log("[PitchProof ClaimFilter] Claims cleared.");
+    addLog("Transcript and claims cleared.", 'info');
   };
 
   return (
@@ -615,7 +772,7 @@ export default function PitchProofPage() {
         </div>
 
         {/* Right Section: Live Transcription Card */}
-        <div className="lg:col-span-5 flex flex-col bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden min-h-[480px]">
+        <div className="lg:col-span-5 flex flex-col bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden h-[640px]">
           {/* Header */}
           <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
             <h2 className="text-xs font-bold uppercase tracking-widest text-slate-400 flex items-center gap-2">
@@ -630,10 +787,10 @@ export default function PitchProofPage() {
           </div>
 
           {/* Transcript Content display */}
-          <div className="flex-1 p-6 relative flex flex-col justify-between overflow-hidden">
-            <div className="flex-1 overflow-y-auto max-h-[380px] pb-12">
+          <div className="flex-1 p-6 relative flex flex-col justify-between overflow-hidden min-h-[220px]">
+            <div className="flex-1 overflow-y-auto max-h-[180px] pb-4">
               {!transcript ? (
-                <p className="text-slate-400 leading-relaxed italic text-sm text-center py-20 px-4">
+                <p className="text-slate-400 leading-relaxed italic text-sm text-center py-10 px-4">
                   Waiting for session to begin... Live transcription will appear here in real-time as the founder speaks.
                 </p>
               ) : (
@@ -650,7 +807,66 @@ export default function PitchProofPage() {
             </div>
 
             {/* Bottom Gradient Fade */}
-            <div className="absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-white to-transparent pointer-events-none"></div>
+            <div className="absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-white to-transparent pointer-events-none"></div>
+          </div>
+
+          {/* Sentence Claim Filter Section */}
+          <div className="flex-1 flex flex-col border-t border-slate-100 min-h-[280px] overflow-hidden">
+            {/* Sub-header */}
+            <div className="px-6 py-3 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-indigo-500 animate-pulse" />
+                Claim Filter (Tier 1)
+              </h3>
+              <span className="text-[10px] font-mono font-semibold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">
+                {sentences.filter(s => s.isCheckable).length} checkable
+              </span>
+            </div>
+
+            {/* List of Segmented Sentences */}
+            <div className="flex-1 p-6 overflow-y-auto space-y-4">
+              {sentences.length === 0 ? (
+                <p className="text-slate-400 leading-relaxed italic text-sm text-center py-12 px-4">
+                  No sentences processed yet. Speak to segment the transcript and filter claims.
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  {sentences.map((item) => (
+                    <motion.div
+                      key={item.id}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className={`p-3 rounded-lg border flex flex-col sm:flex-row sm:items-start gap-3 transition-colors ${
+                        item.isCheckable 
+                          ? 'bg-amber-50/40 border-amber-100 hover:bg-amber-50/70' 
+                          : 'bg-slate-50/30 border-slate-100/70 hover:bg-slate-50/70'
+                      }`}
+                      id={`sentence-card-${item.id}`}
+                    >
+                      {/* Left Badge Indicator */}
+                      <div className="shrink-0">
+                        {item.isCheckable ? (
+                          <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                            <Sparkles className="w-2.5 h-2.5" />
+                            CHECK
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[9px] font-medium tracking-wider uppercase px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 border border-slate-200">
+                            —
+                          </span>
+                        )}
+                      </div>
+                      
+                      {/* Sentence text */}
+                      <div className="text-sm font-normal text-slate-700 leading-relaxed break-words">
+                        {item.sentence}
+                      </div>
+                    </motion.div>
+                  ))}
+                  <div ref={sentencesEndRef} />
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Actions Pane */}
@@ -665,6 +881,7 @@ export default function PitchProofPage() {
                 onClick={handleCopy}
                 disabled={!transcript}
                 className="py-1.5 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-xs"
+                id="copy-transcript-btn"
               >
                 {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                 {copied ? 'Copied' : 'Copy'}
@@ -674,6 +891,7 @@ export default function PitchProofPage() {
                 onClick={handleReset}
                 disabled={!transcript || isSessionActive}
                 className="py-1.5 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-xs"
+                id="reset-transcript-btn"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 Reset

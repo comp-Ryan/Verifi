@@ -24,6 +24,7 @@ const dev = process.env.NODE_ENV !== 'production';
 
 // If running in development mode, delete any existing production `.next` build directory
 // to prevent development/production manifest mismatches (e.g., SegmentViewNode or 833.js errors).
+// We check if a 'next build' process is currently running to avoid deleting files mid-build (race conditions).
 if (dev) {
   const nextDir = path.join(process.cwd(), '.next');
   if (fs.existsSync(nextDir)) {
