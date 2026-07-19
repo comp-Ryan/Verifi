@@ -42,6 +42,77 @@ const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
   const expressApp = express();
+  expressApp.use(express.json({ limit: '1mb' }));
+
+  expressApp.post('/api/verify-claim', async (req: any, res: any) => {
+    try {
+      const sentence = req.body?.sentence;
+      if (!sentence || typeof sentence !== 'string' || !sentence.trim()) {
+        return res.status(400).json({ error: 'Missing sentence' });
+      }
+      console.log('[Verify] Checking claim:', sentence);
+
+      // googleSearch grounding CANNOT be combined with responseMimeType/
+      // responseSchema JSON mode — the API rejects it. Ask for JSON in the
+      // prompt and parse defensively instead.
+      const result = await ai.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text:
+`You are a fact-checker for startup pitch claims. Use Google Search to verify this claim:
+
+"${sentence.trim()}"
+
+Respond with ONLY a JSON object, no markdown fences, no other text:
+{"verdict":"supported"|"contradicted"|"unverifiable","confidence":<0 to 1>,"evidence":"<1-2 sentence summary of what you found>"}
+
+Rules: "supported" only if search results affirm it. "contradicted" only if
+results conflict with it. "unverifiable" if subjective, personal, or search
+finds nothing relevant. A company's own private metrics (their user counts,
+revenue) are usually "unverifiable" unless public sources confirm or
+contradict them.`
+          }]
+        }],
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      const rawText = result.text ?? '';
+      let parsed: any = null;
+      try {
+        const cleaned = rawText.replace(/```json|```/g, '').trim();
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start !== -1 && end > start) parsed = JSON.parse(cleaned.slice(start, end + 1));
+      } catch (parseErr) {
+        console.error('[Verify] JSON parse failed:', parseErr);
+      }
+      if (!parsed || !['supported', 'contradicted', 'unverifiable'].includes(parsed.verdict)) {
+        parsed = { verdict: 'unverifiable', confidence: 0, evidence: 'Verification response could not be parsed.' };
+      }
+
+      // Sources come ONLY from grounding metadata, never from model text
+      const chunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const sources = chunks
+        .map((c: any) => ({ title: c.web?.title ?? 'Source', url: c.web?.uri ?? '' }))
+        .filter((s: any) => s.url)
+        .slice(0, 5);
+
+      return res.json({
+        verdict: parsed.verdict,
+        confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5,
+        evidence: String(parsed.evidence ?? ''),
+        sources,
+      });
+    } catch (err: any) {
+      console.error('[Verify] Endpoint error:', err);
+      return res.status(500).json({ error: 'Verification failed', detail: err?.message || String(err) });
+    }
+  });
+
   const server = createServer(expressApp);
   const wss = new WebSocketServer({ noServer: true });
 

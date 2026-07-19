@@ -19,7 +19,11 @@ import {
   AlertCircle,
   HelpCircle,
   Clock,
-  Settings
+  Settings,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Loader2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -99,6 +103,14 @@ const checkSentenceIsCheckable = (sentence: string): boolean => {
   return false;
 };
 
+type Verdict = 'pending' | 'supported' | 'contradicted' | 'unverifiable' | 'error';
+interface VerificationResult {
+  verdict: Verdict;
+  confidence: number;
+  evidence: string;
+  sources: { title: string; url: string }[];
+}
+
 export default function PitchProofPage() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
@@ -109,6 +121,14 @@ export default function PitchProofPage() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionDuration, setSessionDuration] = useState(0);
   const [sentences, setSentences] = useState<{ id: string; sentence: string; isCheckable: boolean }[]>([]);
+
+  const [verifications, setVerifications] = useState<Record<string, VerificationResult>>({});
+  const [expandedClaims, setExpandedClaims] = useState<Record<string, boolean>>({});
+  const autoVerifyCountRef = useRef(0);
+  const activeVerifyCountRef = useRef(0);
+  const verifyQueueRef = useRef<{ id: string; sentence: string }[]>([]);
+  const MAX_AUTO_VERIFICATIONS = 12;
+  const MAX_CONCURRENT_VERIFICATIONS = 2;
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -125,6 +145,55 @@ export default function PitchProofPage() {
 
   const sentenceBufferRef = useRef<string>('');
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  async function runVerification(id: string, sentence: string) {
+    activeVerifyCountRef.current += 1;
+    setVerifications(prev => ({ ...prev, [id]: { verdict: 'pending', confidence: 0, evidence: '', sources: [] } }));
+    try {
+      const resp = await fetch('/api/verify-claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sentence }),
+      });
+      let errorDetail = '';
+      if (!resp.ok) {
+        try {
+          const errData = await resp.json();
+          errorDetail = errData.detail || errData.error || `HTTP ${resp.status}`;
+        } catch {
+          errorDetail = `HTTP ${resp.status}`;
+        }
+        throw new Error(errorDetail);
+      }
+      const data = await resp.json();
+      console.log('[PitchProof Verify]', { id, sentence, ...data });
+      setVerifications(prev => ({ ...prev, [id]: data }));
+    } catch (err: any) {
+      console.error('[PitchProof Verify] failed:', err);
+      setVerifications(prev => ({ ...prev, [id]: { verdict: 'error', confidence: 0, evidence: err?.message || 'Request failed', sources: [] } }));
+    } finally {
+      activeVerifyCountRef.current -= 1;
+      const next = verifyQueueRef.current.shift();
+      if (next) runVerification(next.id, next.sentence);
+    }
+  }
+
+  function requestVerification(id: string, sentence: string, isManual: boolean) {
+    if (!isManual) {
+      if (autoVerifyCountRef.current >= MAX_AUTO_VERIFICATIONS) return;
+      autoVerifyCountRef.current += 1;
+    }
+    if (activeVerifyCountRef.current >= MAX_CONCURRENT_VERIFICATIONS) {
+      verifyQueueRef.current.push({ id, sentence });
+      setVerifications(prev => ({ ...prev, [id]: { verdict: 'pending', confidence: 0, evidence: '', sources: [] } }));
+    } else {
+      runVerification(id, sentence);
+    }
+  }
+
+  const toggleExpand = (id: string) => {
+    setExpandedClaims(prev => ({ ...prev, [id]: !prev[id] }));
+  };
 
   // Auto-scroll transcript to bottom as new words arrive
   useEffect(() => {
@@ -147,6 +216,8 @@ export default function PitchProofPage() {
     const isCheckable = checkSentenceIsCheckable(sentence);
     const newId = Math.random().toString(36).substring(2, 9);
     
+    if (isCheckable) requestVerification(newId, sentence, false);
+
     setSentences(prev => {
       const updated = [...prev, { id: newId, sentence, isCheckable }];
       const logArray = updated.map(item => ({
@@ -617,6 +688,9 @@ export default function PitchProofPage() {
     setTranscript('');
     setSentences([]);
     sentenceBufferRef.current = '';
+    setVerifications({});
+    autoVerifyCountRef.current = 0;
+    verifyQueueRef.current = [];
     console.log("[PitchProof ClaimFilter] Claims cleared.");
     addLog("Transcript and claims cleared.", 'info');
   };
@@ -844,7 +918,7 @@ export default function PitchProofPage() {
                       id={`sentence-card-${item.id}`}
                     >
                       {/* Left Badge Indicator */}
-                      <div className="shrink-0">
+                      <div className="shrink-0 flex flex-wrap gap-1.5 items-center sm:flex-col sm:items-start">
                         {item.isCheckable ? (
                           <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
                             <Sparkles className="w-2.5 h-2.5" />
@@ -855,11 +929,125 @@ export default function PitchProofPage() {
                             —
                           </span>
                         )}
+
+                        {/* Verification rendering */}
+                        {item.isCheckable && (() => {
+                          const v = verifications[item.id];
+                          if (!v) {
+                            return (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  requestVerification(item.id, item.sentence, true);
+                                }}
+                                className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-indigo-600 hover:bg-indigo-700 text-white border border-indigo-700 cursor-pointer shadow-2xs transition-colors"
+                              >
+                                Verify
+                              </button>
+                            );
+                          }
+
+                          if (v.verdict === 'pending') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                verifying...
+                              </span>
+                            );
+                          }
+
+                          if (v.verdict === 'supported') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                SUPPORTED {Math.round(v.confidence * 100)}%
+                              </span>
+                            );
+                          }
+
+                          if (v.verdict === 'contradicted') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 border border-rose-200">
+                                CONTRADICTED {Math.round(v.confidence * 100)}%
+                              </span>
+                            );
+                          }
+
+                          if (v.verdict === 'unverifiable') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
+                                UNVERIFIED {Math.round(v.confidence * 100)}%
+                              </span>
+                            );
+                          }
+
+                          if (v.verdict === 'error') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-transparent text-rose-700 border border-rose-300">
+                                ERROR
+                              </span>
+                            );
+                          }
+
+                          return null;
+                        })()}
                       </div>
                       
-                      {/* Sentence text */}
-                      <div className="text-sm font-normal text-slate-700 leading-relaxed break-words">
-                        {item.sentence}
+                      {/* Sentence text and optional expanded verification details */}
+                      <div className="flex-1 flex flex-col gap-2">
+                        <div className="text-sm font-normal text-slate-700 leading-relaxed break-words flex items-start justify-between gap-2">
+                          <span className="flex-1">{item.sentence}</span>
+                          {item.isCheckable && verifications[item.id] && verifications[item.id].verdict !== 'pending' && (
+                            <button
+                              onClick={() => toggleExpand(item.id)}
+                              className="p-1 hover:bg-slate-100 rounded-md transition-colors shrink-0 cursor-pointer"
+                              title="Toggle verification details"
+                            >
+                              {expandedClaims[item.id] ? (
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                              ) : (
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                              )}
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Details area */}
+                        {item.isCheckable && verifications[item.id] && verifications[item.id].verdict !== 'pending' && expandedClaims[item.id] && (() => {
+                          const v = verifications[item.id];
+                          return (
+                            <motion.div
+                              initial={{ opacity: 0, height: 0 }}
+                              animate={{ opacity: 1, height: 'auto' }}
+                              className="mt-2 text-xs border-t border-slate-100 pt-2.5 text-slate-600 flex flex-col gap-2"
+                            >
+                              {v.evidence && (
+                                <p className="leading-relaxed bg-slate-50 p-2 rounded-md border border-slate-100">
+                                  <span className="font-bold text-slate-700">Evidence: </span>
+                                  {v.evidence}
+                                </p>
+                              )}
+                              {v.sources && v.sources.length > 0 && (
+                                <div className="flex flex-col gap-1">
+                                  <span className="font-bold text-slate-700">Sources:</span>
+                                  <div className="flex flex-wrap gap-1.5 mt-1">
+                                    {v.sources.map((src, idx) => (
+                                      <a
+                                        key={idx}
+                                        href={src.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[10px] text-indigo-700 hover:bg-indigo-100 transition-colors"
+                                      >
+                                        <ExternalLink className="w-2.5 h-2.5" />
+                                        <span className="max-w-[120px] truncate">{src.title}</span>
+                                      </a>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </motion.div>
+                          );
+                        })()}
                       </div>
                     </motion.div>
                   ))}
