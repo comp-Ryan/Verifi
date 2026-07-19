@@ -24,7 +24,9 @@ import {
   ChevronDown,
   ChevronUp,
   ExternalLink,
-  Loader2
+  Loader2,
+  X,
+  Award
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -112,6 +114,14 @@ interface VerificationResult {
   sources: { title: string; url: string }[];
 }
 
+interface FounderScore {
+  overallScore: number;
+  dimensions: { credibility: number; clarity: number; traction: number; marketUnderstanding: number };
+  summary: string;
+  evidenceTrail: { claim: string; verdict: string; impact: string }[];
+  followUpQuestions: string[];
+}
+
 export default function VerifiPage() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
@@ -125,6 +135,9 @@ export default function VerifiPage() {
 
   const [verifications, setVerifications] = useState<Record<string, VerificationResult>>({});
   const [expandedClaims, setExpandedClaims] = useState<Record<string, boolean>>({});
+  const [founderScore, setFounderScore] = useState<FounderScore | null>(null);
+  const [isScoring, setIsScoring] = useState(false);
+  const [isScoreModalOpen, setIsScoreModalOpen] = useState(false);
   const autoVerifyCountRef = useRef(0);
   const activeVerifyCountRef = useRef(0);
   const verifyQueueRef = useRef<{ id: string; sentence: string }[]>([]);
@@ -198,6 +211,35 @@ export default function VerifiPage() {
         const next = verifyQueueRef.current.shift();
         if (next) runVerification(next.id, next.sentence);
       }, 4000);
+    }
+  }
+
+  async function computeFounderScore() {
+    if (!transcript.trim()) return;
+    setIsScoring(true);
+    setIsScoreModalOpen(true);
+    try {
+      const claims = sentences.map(s => ({
+        sentence: s.sentence,
+        isCheckable: s.isCheckable,
+        ...(verifications[s.id] && !['pending', 'error'].includes(verifications[s.id].verdict)
+          ? { verdict: verifications[s.id].verdict, confidence: verifications[s.id].confidence, evidence: verifications[s.id].evidence }
+          : {}),
+      }));
+      const resp = await fetch('/api/founder-score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript, claims }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      console.log('[Verifi Score]', data);
+      setFounderScore(data);
+    } catch (err: any) {
+      console.error('[Verifi Score] failed:', err);
+      addLog(`Founder Score failed: ${err?.message || String(err)}`, 'error');
+    } finally {
+      setIsScoring(false);
     }
   }
 
@@ -519,6 +561,8 @@ export default function VerifiPage() {
   async function startSession() {
     setSentences([]);
     setVerifications({});
+    setFounderScore(null);
+    setIsScoreModalOpen(false);
     sentenceBufferRef.current = '';
     verifyQueueRef.current = [];
     autoVerifyCountRef.current = 0;
@@ -689,6 +733,8 @@ export default function VerifiPage() {
       setConnectionStatus('disconnected');
     }
     addLog("Session closed. Final transcript retained on-screen.", 'success');
+    if (sentenceBufferRef.current?.trim()) processSentenceBuffer(true);
+    if (transcript.trim()) computeFounderScore();
   }
 
   // Toggle Camera
@@ -721,6 +767,8 @@ export default function VerifiPage() {
     setVerifications({});
     autoVerifyCountRef.current = 0;
     verifyQueueRef.current = [];
+    setFounderScore(null);
+    setIsScoreModalOpen(false);
     console.log("[Verifi ClaimFilter] Claims cleared.");
     addLog("Transcript and claims cleared.", 'info');
   };
@@ -1084,6 +1132,123 @@ export default function VerifiPage() {
                   <div ref={sentencesEndRef} />
                 </div>
               )}
+
+              {/* Founder Score Section */}
+              {(isScoring || founderScore) && (
+                <div className="mt-6 border-t border-slate-200 pt-6">
+                  {isScoring && (
+                    <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+                      <Loader2 className="w-8 h-8 text-indigo-600 animate-spin mb-3" />
+                      <p className="text-sm font-medium text-slate-600">Analyzing pitch & claims...</p>
+                      <p className="text-xs text-slate-400 mt-1">Evaluating credibility, clarity, traction, and market understanding...</p>
+                    </div>
+                  )}
+
+                  {founderScore && !isScoring && (
+                    <div className="space-y-6" id="founder-score-panel">
+                      <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                        <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800 flex items-center gap-2">
+                          <Activity className="w-5 h-5 text-indigo-600" />
+                          Founder Pitch Score
+                        </h3>
+                        <button
+                          onClick={computeFounderScore}
+                          className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold rounded-lg border border-indigo-100 transition-colors cursor-pointer"
+                        >
+                          Score Again
+                        </button>
+                      </div>
+
+                      {/* Overall Score */}
+                      <div className="flex items-center gap-4 bg-indigo-50/50 p-4 rounded-xl border border-indigo-100/40">
+                        <div className="relative shrink-0 flex items-center justify-center">
+                          <div className="w-20 h-20 rounded-full border-4 border-indigo-600 flex flex-col items-center justify-center bg-white shadow-xs">
+                            <span className="text-2xl font-black text-indigo-700">{founderScore.overallScore}</span>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">/ 100</span>
+                          </div>
+                        </div>
+                        <div>
+                          <h4 className="text-sm font-bold text-slate-800">Pitch Quality Index</h4>
+                          <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                            Based on claim accuracy, clarity, traction metrics, and customer/competitor understanding.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Dimensions */}
+                      <div className="space-y-3.5">
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Dimension Analysis</h4>
+                        <div className="grid grid-cols-1 gap-3">
+                          {[
+                            { label: 'Credibility', val: founderScore.dimensions?.credibility, color: 'bg-emerald-500' },
+                            { label: 'Clarity', val: founderScore.dimensions?.clarity, color: 'bg-blue-500' },
+                            { label: 'Traction', val: founderScore.dimensions?.traction, color: 'bg-indigo-500' },
+                            { label: 'Market Understanding', val: founderScore.dimensions?.marketUnderstanding, color: 'bg-amber-500' }
+                          ].map((dim, idx) => (
+                            <div key={idx} className="space-y-1">
+                              <div className="flex justify-between text-xs font-bold">
+                                <span className="text-slate-600">{dim.label}</span>
+                                <span className="text-slate-800">{dim.val ?? 0}/100</span>
+                              </div>
+                              <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                                <div className={`h-full ${dim.color} rounded-full`} style={{ width: `${dim.val ?? 0}%` }} />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Summary */}
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Executive Summary</h4>
+                        <p className="text-xs text-slate-600 leading-relaxed bg-white p-3.5 rounded-lg border border-slate-100">
+                          {founderScore.summary}
+                        </p>
+                      </div>
+
+                      {/* Evidence Trail */}
+                      {founderScore.evidenceTrail && founderScore.evidenceTrail.length > 0 && (
+                        <div className="space-y-2.5">
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Evidence Trail</h4>
+                          <div className="space-y-2">
+                            {founderScore.evidenceTrail.map((trail, idx) => (
+                              <div key={idx} className="text-xs border border-slate-100 bg-white p-3 rounded-lg space-y-1.5 shadow-3xs">
+                                <div className="flex items-center justify-between gap-2 flex-wrap">
+                                  <span className="font-semibold text-slate-700 italic border-l-2 border-slate-200 pl-2">&ldquo;{trail.claim}&rdquo;</span>
+                                  <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                                    trail.verdict?.toLowerCase() === 'supported' ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' :
+                                    trail.verdict?.toLowerCase() === 'contradicted' ? 'bg-rose-50 text-rose-700 border border-rose-100' :
+                                    'bg-slate-50 text-slate-600 border border-slate-100'
+                                  }`}>
+                                    {trail.verdict}
+                                  </span>
+                                </div>
+                                <p className="text-slate-500 text-[11px] leading-relaxed">
+                                  <span className="font-bold text-slate-600">Impact: </span>{trail.impact}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Suggested Follow-Ups */}
+                      {founderScore.followUpQuestions && founderScore.followUpQuestions.length > 0 && (
+                        <div className="space-y-2.5">
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Suggested Follow-Ups</h4>
+                          <ol className="list-decimal list-inside space-y-2 text-xs text-slate-600 bg-slate-50 p-3.5 rounded-lg border border-slate-100">
+                            {founderScore.followUpQuestions.map((q, idx) => (
+                              <li key={idx} className="leading-relaxed pl-1">
+                                <span className="text-slate-700 font-medium">{q}</span>
+                              </li>
+                            ))}
+                          </ol>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1168,6 +1333,187 @@ export default function VerifiPage() {
           </div>
         </div>
       </footer>
+
+      {/* Founder Score Modal overlay */}
+      <AnimatePresence>
+        {isScoreModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-slate-950/60 backdrop-blur-sm"
+            onClick={() => {
+              if (!isScoring) setIsScoreModalOpen(false);
+            }}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 15 }}
+              transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+              className="relative w-full max-w-2xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden max-h-[85vh] flex flex-col text-slate-800"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="h-16 border-b border-slate-100 flex items-center justify-between px-6 shrink-0 bg-slate-50">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center shadow-3xs">
+                    <Award className="w-4.5 h-4.5 text-indigo-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800">Founder Pitch Score</h3>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Real-Time Evaluation</p>
+                  </div>
+                </div>
+                {!isScoring && (
+                  <button
+                    onClick={() => setIsScoreModalOpen(false)}
+                    className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Scrollable Content */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                {isScoring && (
+                  <div className="flex flex-col items-center justify-center py-16 px-4 text-center space-y-4">
+                    <div className="relative">
+                      <div className="w-16 h-16 rounded-full border-4 border-indigo-100 border-t-indigo-600 animate-spin" />
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <Activity className="w-6 h-6 text-indigo-600 animate-pulse" />
+                      </div>
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold text-slate-700 uppercase tracking-wide">Analyzing Pitch & Verifying Claims...</h4>
+                      <p className="text-xs text-slate-500 max-w-sm mt-1.5 leading-relaxed">
+                        Calculating scores for credibility, clarity, traction, and market understanding. Please hold on.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {founderScore && !isScoring && (
+                  <div className="space-y-6">
+                    {/* Overall Score Banner */}
+                    <div className="flex items-center gap-4 bg-indigo-50/50 p-5 rounded-2xl border border-indigo-100/40">
+                      <div className="shrink-0 flex items-center justify-center">
+                        <div className="w-20 h-20 rounded-full border-4 border-indigo-600 flex flex-col items-center justify-center bg-white shadow-xs">
+                          <span className="text-3xl font-black text-indigo-700">{founderScore.overallScore}</span>
+                          <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none">/ 100</span>
+                        </div>
+                      </div>
+                      <div>
+                        <h4 className="text-sm font-bold text-slate-800">Pitch Quality Index</h4>
+                        <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                          Your overall score is compiled from accuracy of claims made, speech structures, traction metric integrity, and market knowledge.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Dimensions Grid */}
+                    <div className="space-y-3">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Performance Metrics</h4>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-slate-50 p-4 rounded-xl border border-slate-100">
+                        {[
+                          { label: 'Credibility', val: founderScore.dimensions?.credibility, color: 'bg-emerald-500' },
+                          { label: 'Clarity', val: founderScore.dimensions?.clarity, color: 'bg-blue-500' },
+                          { label: 'Traction', val: founderScore.dimensions?.traction, color: 'bg-indigo-500' },
+                          { label: 'Market Understanding', val: founderScore.dimensions?.marketUnderstanding, color: 'bg-amber-500' }
+                        ].map((dim, idx) => (
+                          <div key={idx} className="space-y-1.5 bg-white p-3 rounded-lg border border-slate-200/40">
+                            <div className="flex justify-between text-xs font-bold">
+                              <span className="text-slate-600">{dim.label}</span>
+                              <span className="text-slate-800">{dim.val ?? 0}/100</span>
+                            </div>
+                            <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                              <motion.div 
+                                initial={{ width: 0 }}
+                                animate={{ width: `${dim.val ?? 0}%` }}
+                                transition={{ duration: 0.8, delay: 0.1 * idx }}
+                                className={`h-full ${dim.color} rounded-full`} 
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Summary */}
+                    <div className="space-y-2">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Executive Summary</h4>
+                      <p className="text-xs text-slate-600 leading-relaxed bg-white p-4 rounded-xl border border-slate-100">
+                        {founderScore.summary}
+                      </p>
+                    </div>
+
+                    {/* Evidence Trail */}
+                    {founderScore.evidenceTrail && founderScore.evidenceTrail.length > 0 && (
+                      <div className="space-y-2.5">
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Evidence Trail</h4>
+                        <div className="space-y-2.5 max-h-[220px] overflow-y-auto pr-1">
+                          {founderScore.evidenceTrail.map((trail, idx) => (
+                            <div key={idx} className="text-xs border border-slate-100 bg-white p-3 rounded-lg space-y-1.5 shadow-3xs hover:border-slate-200 transition-all">
+                              <div className="flex items-start justify-between gap-2">
+                                <span className="font-semibold text-slate-700 italic border-l-2 border-slate-200 pl-2">&ldquo;{trail.claim}&rdquo;</span>
+                                <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase whitespace-nowrap shrink-0 ${
+                                  trail.verdict?.toLowerCase() === 'supported' ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' :
+                                  trail.verdict?.toLowerCase() === 'contradicted' ? 'bg-rose-50 text-rose-700 border border-rose-100' :
+                                  'bg-slate-50 text-slate-600 border border-slate-100'
+                                }`}>
+                                  {trail.verdict}
+                                </span>
+                              </div>
+                              <p className="text-slate-500 text-[11px] leading-relaxed">
+                                <span className="font-bold text-slate-600">Impact: </span>{trail.impact}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Suggested Follow-Ups */}
+                    {founderScore.followUpQuestions && founderScore.followUpQuestions.length > 0 && (
+                      <div className="space-y-2.5">
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Suggested Follow-Ups</h4>
+                        <ol className="list-decimal list-inside space-y-2 text-xs text-slate-600 bg-slate-50 p-4 rounded-xl border border-slate-100">
+                          {founderScore.followUpQuestions.map((q, idx) => (
+                            <li key={idx} className="leading-relaxed pl-1">
+                              <span className="text-slate-700 font-medium">{q}</span>
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="h-16 border-t border-slate-100 flex items-center justify-end gap-3 px-6 shrink-0 bg-slate-50">
+                {!isScoring && (
+                  <>
+                    <button
+                      onClick={computeFounderScore}
+                      className="px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold rounded-lg border border-indigo-100 transition-colors cursor-pointer"
+                    >
+                      Score Again
+                    </button>
+                    <button
+                      onClick={() => setIsScoreModalOpen(false)}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

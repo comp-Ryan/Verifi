@@ -115,6 +115,86 @@ contradict them.`
     }
   });
 
+  expressApp.post('/api/founder-score', async (req: any, res: any) => {
+    try {
+      const { transcript, claims } = req.body ?? {};
+      if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+        return res.status(400).json({ error: 'Missing transcript' });
+      }
+      const claimsSummary = Array.isArray(claims) ? claims.map((c: any) =>
+        `- "${c.sentence}" [checkable: ${c.isCheckable}${c.verdict ? `, verdict: ${c.verdict}, confidence: ${c.confidence}, evidence: ${c.evidence}` : ''}]`
+      ).join('\n') : 'None';
+
+      // No search tool in this call, so structured JSON output IS allowed here.
+      const result = await ai.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text:
+`You are an investor-grade pitch evaluator. Score this founder's pitch.
+
+TRANSCRIPT:
+${transcript.trim()}
+
+CLAIMS AND VERIFICATION VERDICTS:
+${claimsSummary}
+
+Scoring rules: contradicted claims damage credibility heavily. Supported
+specific claims raise it. Unverifiable big claims are mild negatives.
+Judge clarity from the transcript structure, traction from concrete
+supported metrics, and market understanding from specificity about
+customers and competition. All dimension scores and overallScore are
+0-100.`
+          }]
+        }],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'object',
+            properties: {
+              overallScore: { type: 'number' },
+              dimensions: {
+                type: 'object',
+                properties: {
+                  credibility: { type: 'number' },
+                  clarity: { type: 'number' },
+                  traction: { type: 'number' },
+                  marketUnderstanding: { type: 'number' },
+                },
+                required: ['credibility', 'clarity', 'traction', 'marketUnderstanding'],
+              },
+              summary: { type: 'string' },
+              evidenceTrail: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    claim: { type: 'string' },
+                    verdict: { type: 'string' },
+                    impact: { type: 'string' },
+                  },
+                  required: ['claim', 'verdict', 'impact'],
+                },
+              },
+              followUpQuestions: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['overallScore', 'dimensions', 'summary', 'evidenceTrail', 'followUpQuestions'],
+          },
+        },
+      });
+
+      const parsed = JSON.parse(result.text ?? '{}');
+      return res.json(parsed);
+    } catch (err: any) {
+      console.error('[Score] Endpoint error:', err);
+      if (String(err?.message || err).includes('429') || String(err?.message || err).includes('RESOURCE_EXHAUSTED')) {
+        return res.status(429).json({ error: 'Rate limited', detail: err?.message || String(err) });
+      }
+      return res.status(500).json({ error: 'Scoring failed', detail: err?.message || String(err) });
+    }
+  });
+
   const server = createServer(expressApp);
   const wss = new WebSocketServer({ noServer: true });
 
