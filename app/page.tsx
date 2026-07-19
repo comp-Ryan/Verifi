@@ -47,6 +47,10 @@ export default function PitchProofPage() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const retryCountRef = useRef<number>(0);
+  const isSessionActiveRef = useRef<boolean>(false);
+  const maxRetries = 3;
 
   // Auto-scroll transcript to bottom as new words arrive
   useEffect(() => {
@@ -124,12 +128,165 @@ export default function PitchProofPage() {
     return btoa(binary);
   };
 
+  // Handle disconnection or transient failures with retry logic
+  function handleDisconnectOrFailure(reason: string) {
+    // If the session is no longer active (user clicked stop or unmounted), ignore
+    if (!isSessionActiveRef.current) {
+      return;
+    }
+
+    if (retryCountRef.current < maxRetries) {
+      retryCountRef.current += 1;
+      // Exponential backoff with a cap at 6 seconds
+      const backoffDelay = Math.min(6000, 1000 * Math.pow(1.5, retryCountRef.current));
+      addLog(`Connection issues detected (${reason}). Retrying (Attempt ${retryCountRef.current}/${maxRetries}) in ${(backoffDelay / 1000).toFixed(1)}s...`, 'info');
+      
+      // Keep UI in connecting/initializing state to avoid flickering to error or disconnected
+      setConnectionStatus('connecting');
+
+      // Safely clear the active WebSocket so we can spawn a fresh one
+      if (wsRef.current) {
+        try {
+          wsRef.current.onopen = null;
+          wsRef.current.onmessage = null;
+          wsRef.current.onerror = null;
+          wsRef.current.onclose = null;
+          wsRef.current.close();
+        } catch (wsErr) {
+          console.error("[PitchProof] Error closing WS during retry backoff:", wsErr);
+        }
+        wsRef.current = null;
+      }
+
+      // Schedule the next connection attempt
+      reconnectTimeoutRef.current = setTimeout(() => {
+        if (isSessionActiveRef.current) {
+          connectWebSocket();
+        }
+      }, backoffDelay);
+    } else {
+      addLog(`All ${maxRetries} reconnect attempts exhausted. Tearing down session.`, 'error');
+      setConnectionStatus('error');
+      setErrorMsg(`Connection failed after ${maxRetries} retry attempts. (${reason})`);
+      stopSession(`Reconnect attempts exhausted: ${reason}`);
+    }
+  }
+
+  // Connect and bind the relay WebSocket lifecycle
+  function connectWebSocket() {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+
+    if (wsRef.current) {
+      try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      } catch (wsErr) {
+        console.error("[PitchProof] Error clearing old WS:", wsErr);
+      }
+      wsRef.current = null;
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/live-ws`;
+    addLog(`Connecting relay WebSocket to ${wsUrl}... (Attempt ${retryCountRef.current + 1}/${maxRetries + 1})`, 'info');
+
+    // Make sure we represent connecting status in UI
+    setConnectionStatus('connecting');
+
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      addLog("Relay WebSocket connection opened. Awaiting Gemini Live API handshake...", 'success');
+    };
+
+    ws.onmessage = (event) => {
+      console.log("[PitchProof Client WS Raw Message Received]:", event.data);
+      try {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'status') {
+          if (msg.status === 'connected') {
+            setConnectionStatus('connected');
+            // Reset retry count upon successfully receiving 'connected' state from Gemini
+            retryCountRef.current = 0;
+            addLog(`Gemini Live API connected and pipeline is streaming! (Model: ${msg.model || 'unknown'})`, 'success');
+          } else if (msg.status === 'disconnected') {
+            const disconnectReason = msg.reason ? ` Reason: ${msg.reason} (Code: ${msg.code || 'N/A'})` : '';
+            addLog(`Gemini Live API session disconnected.${disconnectReason}`, 'info');
+            
+            // This is a session disconnect message describing the inner state - trigger retry
+            handleDisconnectOrFailure(`Gemini session disconnected: ${msg.reason || 'No reason'}`);
+          } else {
+            addLog(`Gemini connection state update: ${msg.status}`, 'info');
+          }
+        } else if (msg.type === 'transcription') {
+          console.log("[PitchProof Live Transcript Chunk Received]:", msg.text);
+          setTranscript(prev => prev ? prev + " " + msg.text : msg.text);
+          addLog(`Live transcription chunk: "${msg.text}"`, 'streaming');
+        } else if (msg.type === 'error') {
+          addLog(`Gemini Live API inner error message received: ${msg.error}`, 'error');
+          
+          // Classify whether the error is completely unrecoverable vs transient
+          const isUnrecoverable = 
+            msg.error.includes("not found for API version") || 
+            msg.error.includes("not supported for bidiGenerateContent") || 
+            msg.error.includes("API_KEY environment variable is required") || 
+            msg.error.includes("both primary and fallback models") || 
+            msg.error.includes("unauthorized") || 
+            msg.error.includes("invalid api key");
+
+          if (isUnrecoverable) {
+            addLog("Error is unrecoverable. Stopping session.", 'error');
+            setConnectionStatus('error');
+            setErrorMsg(msg.error);
+            stopSession(`Unrecoverable Gemini Live API error: ${msg.error}`, { error: msg.error });
+          } else {
+            // Trigger retry for other transient errors
+            handleDisconnectOrFailure(`Gemini session error: ${msg.error}`);
+          }
+        }
+      } catch (parseErr: any) {
+        console.error("[PitchProof message-handling error] Failed to parse or process websocket message:", parseErr, parseErr.stack);
+        addLog(`Message handling error: ${parseErr.message || String(parseErr)}`, 'error');
+      }
+    };
+
+    ws.onerror = (e) => {
+      // Log WebSocket client connection error.
+      // We don't immediately call retry here because onclose is guaranteed to trigger next.
+      console.error("[PitchProof] Relay WebSocket client onerror:", e);
+      addLog("Relay WebSocket connection error encountered.", 'error');
+    };
+
+    ws.onclose = (event) => {
+      console.warn(`[PitchProof] Relay WebSocket onclose event. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
+      addLog(`Relay WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`, 'info');
+      
+      // Let's retry unless it was a clean close or user stopped the session
+      if (isSessionActiveRef.current) {
+        handleDisconnectOrFailure(`Relay WebSocket closed (Code: ${event.code})`);
+      }
+    };
+  }
+
   // Start the live audio capture and Gemini session
-  const startSession = async () => {
+  async function startSession() {
     setErrorMsg(null);
     setSessionDuration(0);
     setConnectionStatus('connecting');
     addLog("Initializing real-time audio/video capture session...", 'info');
+
+    // Mark session as active synchronously so WebSocket events know they can proceed
+    isSessionActiveRef.current = true;
+    setIsSessionActive(true);
+    retryCountRef.current = 0;
 
     try {
       // 1. Request microphone & camera
@@ -164,69 +321,7 @@ export default function PitchProofPage() {
         videoRef.current.srcObject = stream;
       }
 
-      // 2. Establish WebSocket to our server
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/live-ws`;
-      addLog(`Connecting relay WebSocket to ${wsUrl}...`, 'info');
-      
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        addLog("Relay WebSocket connection opened. Awaiting Gemini Live API shake-hand...", 'success');
-      };
-
-      ws.onmessage = (event) => {
-        // Raw message logging as requested
-        console.log("[PitchProof Client WS Raw Message Received]:", event.data);
-        try {
-          const msg = JSON.parse(event.data);
-          
-          if (msg.type === 'status') {
-            if (msg.status === 'connected') {
-              setConnectionStatus('connected');
-              addLog(`Gemini Live API connected and pipeline is streaming! (Model: ${msg.model || 'unknown'})`, 'success');
-            } else if (msg.status === 'disconnected') {
-              setConnectionStatus('disconnected');
-              const disconnectReason = msg.reason ? ` Reason: ${msg.reason} (Code: ${msg.code || 'N/A'})` : '';
-              addLog(`Gemini Live API session disconnected.${disconnectReason}`, 'info');
-              // Automatically call stopSession to clean up devices and update active state cleanly
-              stopSession(`WebSocket disconnected status received: ${disconnectReason}`, { code: msg.code, reason: msg.reason });
-            } else {
-              addLog(`Gemini connection state update: ${msg.status}`, 'info');
-            }
-          } else if (msg.type === 'transcription') {
-            // Log every transcription chunk in the browser console as explicitly requested
-            console.log("[PitchProof Live Transcript Chunk Received]:", msg.text);
-            // Append incoming live words continuously
-            setTranscript(prev => prev ? prev + " " + msg.text : msg.text);
-            addLog(`Live transcription chunk: "${msg.text}"`, 'streaming');
-          } else if (msg.type === 'error') {
-            setConnectionStatus('error');
-            setErrorMsg(msg.error);
-            addLog(`Gemini Live API error: ${msg.error}`, 'error');
-            stopSession(`WebSocket reported server-side error: ${msg.error}`, { error: msg.error });
-          }
-        } catch (parseErr: any) {
-          console.error("[PitchProof message-handling error] Failed to parse or process websocket message:", parseErr, parseErr.stack);
-          addLog(`Message handling error: ${parseErr.message || String(parseErr)}`, 'error');
-        }
-      };
-
-      ws.onerror = (e) => {
-        setConnectionStatus('error');
-        addLog("WebSocket client error encountered.", 'error');
-        console.error("[PitchProof] WebSocket client error:", e);
-        stopSession("WebSocket client error event", { event: e });
-      };
-
-      ws.onclose = (event) => {
-        console.warn(`[PitchProof] Relay WebSocket onclose event. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
-        addLog(`Relay WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`, 'info');
-        stopSession(`Relay WebSocket closed (Code: ${event.code}, Reason: ${event.reason || 'None'})`, { code: event.code, reason: event.reason });
-      };
-
-      // 3. Setup Audio Capture Processor
+      // 2. Setup Audio Capture Processor
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       audioContextRef.current = audioCtx;
 
@@ -240,19 +335,20 @@ export default function PitchProofPage() {
 
       processor.onaudioprocess = (e) => {
         try {
-          if (ws.readyState === WebSocket.OPEN && wsRef.current?.readyState === WebSocket.OPEN) {
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             const rawFloatData = e.inputBuffer.getChannelData(0);
             const base64PCM = pcmToBase64(rawFloatData);
-            ws.send(JSON.stringify({ type: 'audio', data: base64PCM }));
+            wsRef.current.send(JSON.stringify({ type: 'audio', data: base64PCM }));
           }
         } catch (audioErr: any) {
           console.error("[PitchProof Audio Process Error] Error capturing/encoding/sending audio:", audioErr, audioErr.stack);
           addLog(`Audio processing error: ${audioErr.message || String(audioErr)}`, 'error');
-          stopSession(`Exception during audio capture/processing: ${audioErr.message || String(audioErr)}`, { error: audioErr, stack: audioErr.stack });
+          handleDisconnectOrFailure(`Audio processing exception: ${audioErr.message || String(audioErr)}`);
         }
       };
 
-      setIsSessionActive(true);
+      // 3. Initiate WebSocket connection
+      connectWebSocket();
 
     } catch (err: any) {
       console.error("Session startup failure:", err, err.stack);
@@ -261,7 +357,7 @@ export default function PitchProofPage() {
       addLog(`Failed to start session: ${err.message || String(err)}`, 'error');
       stopSession(`Exception during session startup: ${err.message || String(err)}`, { error: err, stack: err.stack });
     }
-  };
+  }
 
   // Stop the live session
   function stopSession(reason: string = 'User initiated stop', details?: any) {
@@ -271,6 +367,13 @@ export default function PitchProofPage() {
     });
     addLog(`Stopping live capture and closing active pipelines... Reason: ${reason}`, 'info');
     
+    // Clear any reconnect timeouts
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    retryCountRef.current = 0;
+
     // Stop all media tracks (camera & microphone)
     if (streamRef.current) {
       try {
@@ -312,6 +415,10 @@ export default function PitchProofPage() {
     // Close WebSocket
     if (wsRef.current) {
       try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
         if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
           wsRef.current.close(1000, "Session stopped by request");
         }
@@ -321,6 +428,7 @@ export default function PitchProofPage() {
       wsRef.current = null;
     }
 
+    isSessionActiveRef.current = false;
     setIsSessionActive(false);
     if (connectionStatus !== 'error') {
       setConnectionStatus('disconnected');
