@@ -1,6 +1,10 @@
 # Verifi
 
-A live diligence assistant for founder pitches. Verifi listens to a pitch in real time, transcribes it, flags factual claims worth checking, verifies them against the web, and produces an investor-style score when the session ends.
+<img src="assets/hackathon-logo.avif" alt="Stanford x DeepMind Hackathon" width="200" />
+
+A live diligence assistant for founder pitches. Built for the Stanford x DeepMind hackathon. Verifi listens to a pitch in real time, transcribes it, flags factual claims worth checking, verifies them against the web, and produces an investor-style score when the session ends.
+
+![Verifi live session — video feed, live transcript, and claim filter with verification badges](assets/screenshot.png)
 
 ## How it works
 
