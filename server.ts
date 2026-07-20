@@ -66,13 +66,18 @@ app.prepare().then(() => {
 "${sentence.trim()}"
 
 Respond with ONLY a JSON object, no markdown fences, no other text:
-{"verdict":"supported"|"contradicted"|"unverifiable","confidence":<0 to 1>,"evidence":"<1-2 sentence summary of what you found>"}
+{"verdict":"supported"|"contradicted"|"mixed"|"unverifiable","confidence":<0 to 1>,"evidence":"<2-3 sentence explanation of the reasoning: what was searched, what was found, and why this verdict>"}
 
-Rules: "supported" only if search results affirm it. "contradicted" only if
-results conflict with it. "unverifiable" if subjective, personal, or search
-finds nothing relevant. A company's own private metrics (their user counts,
-revenue) are usually "unverifiable" unless public sources confirm or
-contradict them.`
+Rules: "supported" only if search results affirm the whole claim.
+"contradicted" only if results conflict with it. "mixed" when the sentence
+contains multiple factual assertions and search confirms some but
+contradicts or fails to support others — the evidence text MUST state which
+part is right and which part is wrong. "unverifiable" if subjective,
+personal, or search finds nothing relevant — the evidence text MUST explain
+WHY it could not be verified (e.g. private company metric, subjective
+claim, no relevant search results). A company's own private metrics (their
+user counts, revenue) are usually "unverifiable" unless public sources
+confirm or contradict them.`
           }]
         }],
         config: {
@@ -90,7 +95,7 @@ contradict them.`
       } catch (parseErr) {
         console.error('[Verify] JSON parse failed:', parseErr);
       }
-      if (!parsed || !['supported', 'contradicted', 'unverifiable'].includes(parsed.verdict)) {
+      if (!parsed || !['supported', 'contradicted', 'mixed', 'unverifiable'].includes(parsed.verdict)) {
         parsed = { verdict: 'unverifiable', confidence: 0, evidence: 'Verification response could not be parsed.' };
       }
 
@@ -112,6 +117,56 @@ contradict them.`
       const errMsg = err?.message || String(err);
       const isRateLimit = errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED');
       return res.status(isRateLimit ? 429 : 500).json({ error: 'Verification failed', detail: errMsg });
+    }
+  });
+
+  expressApp.post('/api/classify-claim', async (req: any, res: any) => {
+    try {
+      const sentence = req.body?.sentence;
+      if (!sentence || typeof sentence !== 'string' || !sentence.trim()) {
+        return res.status(400).json({ error: 'Missing sentence' });
+      }
+      // Cheap, fast model — no search tool, so structured JSON is allowed
+      const result = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text:
+`A founder is pitching their startup. Decide if this sentence contains a
+factual claim worth fact-checking with a web search:
+
+"${sentence.trim()}"
+
+checkable = true if it asserts something verifiable about the world:
+statistics, market sizes, competitor facts, company facts, funding,
+traction numbers, "first/only/biggest" style claims, named partnerships,
+public figures or events.
+checkable = false for: opinions, vision/mission statements, generic tech
+descriptions ("we use AI"), personal anecdotes, filler, greetings,
+questions, or the founder's own private unpublished metrics that no
+search could confirm.`
+          }]
+        }],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'object',
+            properties: {
+              checkable: { type: 'boolean' },
+              reason: { type: 'string' },
+            },
+            required: ['checkable', 'reason'],
+          },
+        },
+      });
+      const parsed = JSON.parse(result.text ?? '{}');
+      return res.json({ checkable: !!parsed.checkable, reason: String(parsed.reason ?? '') });
+    } catch (err: any) {
+      console.error('[Classify] Endpoint error:', err);
+      const errMsg = err?.message || String(err);
+      const isRateLimit = errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED');
+      return res.status(isRateLimit ? 429 : 500).json({ error: 'Classification failed', detail: errMsg });
     }
   });
 
@@ -142,6 +197,8 @@ ${claimsSummary}
 
 Scoring rules: contradicted claims damage credibility heavily. Supported
 specific claims raise it. Unverifiable big claims are mild negatives.
+Mixed verdicts count as partially credible and should generate a follow-up
+question targeting the incorrect part.
 Judge clarity from the transcript structure, traction from concrete
 supported metrics, and market understanding from specificity about
 customers and competition. All dimension scores and overallScore are
@@ -215,8 +272,11 @@ customers and competition. All dimension scores and overallScore are
     }
   });
 
-  // Initialize Google Gen AI
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Initialize Google Gen AI. GEMINI_API_KEY_PAID (a user-named secret) wins
+  // over GEMINI_API_KEY, which AI Studio auto-injects and may point at a
+  // free-tier project.
+  const apiKey = process.env.GEMINI_API_KEY_PAID || process.env.GEMINI_API_KEY;
+  console.log('[Live API] Using key source:', process.env.GEMINI_API_KEY_PAID ? 'GEMINI_API_KEY_PAID' : 'GEMINI_API_KEY', '(length:', (apiKey || '').length + ')');
   if (!apiKey) {
     console.error("[Live API Error] GEMINI_API_KEY is not defined in the environment.");
   }

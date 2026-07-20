@@ -106,7 +106,51 @@ const checkSentenceIsCheckable = (sentence: string): boolean => {
   return false;
 };
 
-type Verdict = 'pending' | 'supported' | 'contradicted' | 'unverifiable' | 'error';
+// Abbreviations that end with "." but do not end a sentence
+const NON_TERMINAL_ABBREVIATIONS = new Set([
+  'dr', 'mr', 'mrs', 'ms', 'inc', 'co', 'corp', 'ltd', 'st', 'vs', 'etc',
+  'e.g', 'i.e', 'u.s', 'a.m', 'p.m'
+]);
+
+// Split buffered transcript text into complete sentences without breaking on
+// decimals ("3.5"), versions ("GPT-4.1"), no-space periods (URLs), or common
+// abbreviations. Returns completed sentences plus the unfinished remainder.
+const splitIntoSentences = (text: string): { sentences: string[]; remainder: string } => {
+  const sentences: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== '.' && ch !== '?' && ch !== '!') continue;
+
+    // Consume runs of terminal punctuation ("?!", "...") as one boundary
+    let end = i;
+    while (end + 1 < text.length && '.?!'.includes(text[end + 1])) end++;
+
+    if (ch === '.') {
+      const prev = text[i - 1] ?? '';
+      const next = text[end + 1] ?? '';
+      // Decimal or version number: digit on both sides
+      if (/\d/.test(prev) && /\d/.test(next)) { i = end; continue; }
+      // No space after: URL, "perplexity.ai", mid-token period
+      if (next && !/\s/.test(next)) { i = end; continue; }
+      // Abbreviation before the period
+      const wordMatch = text.slice(start, i).match(/([A-Za-z][A-Za-z.]*)$/);
+      if (wordMatch && NON_TERMINAL_ABBREVIATIONS.has(wordMatch[1].toLowerCase().replace(/\.+$/, ''))) {
+        i = end; continue;
+      }
+    }
+
+    sentences.push(text.slice(start, end + 1).trim());
+    start = end + 1;
+    i = end;
+  }
+  return {
+    sentences: sentences.filter(s => s.length > 0),
+    remainder: text.slice(start).trim(),
+  };
+};
+
+type Verdict = 'pending' | 'supported' | 'contradicted' | 'mixed' | 'unverifiable' | 'error';
 interface VerificationResult {
   verdict: Verdict;
   confidence: number;
@@ -131,10 +175,9 @@ export default function VerifiPage() {
   const [cameraActive, setCameraActive] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionDuration, setSessionDuration] = useState(0);
-  const [sentences, setSentences] = useState<{ id: string; sentence: string; isCheckable: boolean }[]>([]);
+  const [sentences, setSentences] = useState<{ id: string; sentence: string; isCheckable: boolean; classification: 'heuristic' | 'classifying' | 'model-checkable' | 'not-checkable' }[]>([]);
 
   const [verifications, setVerifications] = useState<Record<string, VerificationResult>>({});
-  const [expandedClaims, setExpandedClaims] = useState<Record<string, boolean>>({});
   const [founderScore, setFounderScore] = useState<FounderScore | null>(null);
   const [isScoring, setIsScoring] = useState(false);
   const [isScoreModalOpen, setIsScoreModalOpen] = useState(false);
@@ -144,6 +187,33 @@ export default function VerifiPage() {
   const retriedSentencesRef = useRef<Record<string, boolean>>({});
   const MAX_AUTO_VERIFICATIONS = 12;
   const MAX_CONCURRENT_VERIFICATIONS = 1;
+
+  // Tier 2 classification queue (cheap model, higher rate limits than grounded search)
+  const classifyQueueRef = useRef<{ id: string; sentence: string }[]>([]);
+  const activeClassifyCountRef = useRef(0);
+  const MAX_CONCURRENT_CLASSIFICATIONS = 3;
+
+  // Claim detail modal
+  const [detailClaimId, setDetailClaimId] = useState<string | null>(null);
+
+  // Waits for in-flight verifications before scoring
+  const scoreWaitTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Live audio meter / speaking indicator
+  const rmsRef = useRef(0);
+  const lastSpeechTsRef = useRef(0);
+  const meterTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  // Refs mirroring state, so callbacks captured in old closures (WS handlers,
+  // timers) always see current values
+  const transcriptRef = useRef('');
+  const sentencesRef = useRef<typeof sentences>([]);
+  const verificationsRef = useRef<Record<string, VerificationResult>>({});
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
+  useEffect(() => { sentencesRef.current = sentences; }, [sentences]);
+  useEffect(() => { verificationsRef.current = verifications; }, [verifications]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -215,11 +285,13 @@ export default function VerifiPage() {
   }
 
   async function computeFounderScore() {
-    if (!transcript.trim()) return;
+    if (!transcriptRef.current.trim()) return;
     setIsScoring(true);
     setIsScoreModalOpen(true);
     try {
-      const claims = sentences.map(s => ({
+      const transcript = transcriptRef.current;
+      const verifications = verificationsRef.current;
+      const claims = sentencesRef.current.map(s => ({
         sentence: s.sentence,
         isCheckable: s.isCheckable,
         ...(verifications[s.id] && !['pending', 'error'].includes(verifications[s.id].verdict)
@@ -243,6 +315,77 @@ export default function VerifiPage() {
     }
   }
 
+  // Wait for in-flight verifications/classifications to settle (max 60s),
+  // then compute the Founder Score with complete verdicts.
+  function scheduleFounderScore() {
+    if (!transcriptRef.current.trim()) return;
+    if (scoreWaitTimerRef.current) clearInterval(scoreWaitTimerRef.current);
+
+    setIsScoring(true);
+    setIsScoreModalOpen(true);
+
+    const startedAt = Date.now();
+    const check = () => {
+      const hasPendingVerifications =
+        activeVerifyCountRef.current > 0 ||
+        verifyQueueRef.current.length > 0 ||
+        Object.values(verificationsRef.current).some(v => v.verdict === 'pending');
+      const hasPendingClassifications =
+        activeClassifyCountRef.current > 0 ||
+        classifyQueueRef.current.length > 0 ||
+        sentencesRef.current.some(s => s.classification === 'classifying');
+      const timedOut = Date.now() - startedAt > 60000;
+
+      if ((!hasPendingVerifications && !hasPendingClassifications) || timedOut) {
+        if (scoreWaitTimerRef.current) {
+          clearInterval(scoreWaitTimerRef.current);
+          scoreWaitTimerRef.current = null;
+        }
+        if (timedOut) addLog('Some verifications did not finish in time; scoring with available verdicts.', 'info');
+        computeFounderScore();
+      }
+    };
+
+    scoreWaitTimerRef.current = setInterval(check, 1000);
+    check();
+  }
+
+  async function runClassification(id: string, sentence: string) {
+    activeClassifyCountRef.current += 1;
+    try {
+      const resp = await fetch('/api/classify-claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sentence }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      console.log('[Verifi Classify]', { sentence, checkable: data.checkable, reason: data.reason });
+      setSentences(prev => prev.map(s => s.id === id
+        ? { ...s, isCheckable: !!data.checkable, classification: data.checkable ? 'model-checkable' : 'not-checkable' }
+        : s));
+      if (data.checkable) {
+        requestVerification(id, sentence, false);
+      }
+    } catch (err: any) {
+      // Fail open to not-checkable — classification is not critical, no retry
+      console.error('[Verifi Classify] failed:', err);
+      setSentences(prev => prev.map(s => s.id === id ? { ...s, classification: 'not-checkable' } : s));
+    } finally {
+      activeClassifyCountRef.current -= 1;
+      const next = classifyQueueRef.current.shift();
+      if (next) runClassification(next.id, next.sentence);
+    }
+  }
+
+  function requestClassification(id: string, sentence: string) {
+    if (activeClassifyCountRef.current >= MAX_CONCURRENT_CLASSIFICATIONS) {
+      classifyQueueRef.current.push({ id, sentence });
+    } else {
+      runClassification(id, sentence);
+    }
+  }
+
   function requestVerification(id: string, sentence: string, isManual: boolean) {
     if (!isManual) {
       if (autoVerifyCountRef.current >= MAX_AUTO_VERIFICATIONS) return;
@@ -256,9 +399,15 @@ export default function VerifiPage() {
     }
   }
 
-  const toggleExpand = (id: string) => {
-    setExpandedClaims(prev => ({ ...prev, [id]: !prev[id] }));
-  };
+  // Close the claim detail modal on Escape
+  useEffect(() => {
+    if (!detailClaimId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setDetailClaimId(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [detailClaimId]);
 
   // Auto-scroll transcript to bottom as new words arrive
   useEffect(() => {
@@ -276,15 +425,26 @@ export default function VerifiPage() {
 
   const addSentence = (rawSentence: string) => {
     const sentence = rawSentence.trim();
-    if (!sentence) return;
+    // Skip stray fragments: too short or containing no letters at all
+    if (sentence.length < 4 || !/[a-zA-Z]/.test(sentence)) return;
 
-    const isCheckable = checkSentenceIsCheckable(sentence);
+    const heuristicCheckable = checkSentenceIsCheckable(sentence);
+    const wordCount = sentence.split(/\s+/).length;
     const newId = Math.random().toString(36).substring(2, 9);
-    
-    if (isCheckable) requestVerification(newId, sentence, false);
+
+    // Tier 1 hit: checkable immediately. Otherwise Tier 2: let the cheap
+    // model decide, for sentences long enough to hold a real claim.
+    const classification: 'heuristic' | 'classifying' | 'not-checkable' =
+      heuristicCheckable ? 'heuristic' : wordCount >= 5 ? 'classifying' : 'not-checkable';
+
+    if (heuristicCheckable) {
+      requestVerification(newId, sentence, false);
+    } else if (classification === 'classifying') {
+      requestClassification(newId, sentence);
+    }
 
     setSentences(prev => {
-      const updated = [...prev, { id: newId, sentence, isCheckable }];
+      const updated = [...prev, { id: newId, sentence, isCheckable: heuristicCheckable, classification }];
       const logArray = updated.map(item => ({
         sentence: item.sentence,
         isCheckable: item.isCheckable
@@ -304,19 +464,10 @@ export default function VerifiPage() {
       return;
     }
 
-    const regex = /([^.!?]*[.!?]+)/g;
-    let match;
-    let lastIndex = 0;
-    const matches: string[] = [];
-    
-    while ((match = regex.exec(text)) !== null) {
-      matches.push(match[1]);
-      lastIndex = regex.lastIndex;
-    }
-    
-    if (matches.length > 0) {
-      matches.forEach(s => addSentence(s));
-      sentenceBufferRef.current = text.slice(lastIndex).trim();
+    const { sentences: completed, remainder } = splitIntoSentences(text);
+    if (completed.length > 0) {
+      completed.forEach(s => addSentence(s));
+      sentenceBufferRef.current = remainder;
     }
   };
 
@@ -563,10 +714,16 @@ export default function VerifiPage() {
     setVerifications({});
     setFounderScore(null);
     setIsScoreModalOpen(false);
+    setDetailClaimId(null);
     sentenceBufferRef.current = '';
     verifyQueueRef.current = [];
     autoVerifyCountRef.current = 0;
     retriedSentencesRef.current = {};
+    classifyQueueRef.current = [];
+    if (scoreWaitTimerRef.current) {
+      clearInterval(scoreWaitTimerRef.current);
+      scoreWaitTimerRef.current = null;
+    }
 
     setErrorMsg(null);
     setSessionDuration(0);
@@ -625,8 +782,16 @@ export default function VerifiPage() {
 
       processor.onaudioprocess = (e) => {
         try {
+          const rawFloatData = e.inputBuffer.getChannelData(0);
+
+          // Live level meter: RMS into a ref (no setState at audio rate)
+          let sumSquares = 0;
+          for (let i = 0; i < rawFloatData.length; i++) sumSquares += rawFloatData[i] * rawFloatData[i];
+          const rms = Math.sqrt(sumSquares / rawFloatData.length);
+          rmsRef.current = rms;
+          if (rms > 0.02) lastSpeechTsRef.current = Date.now();
+
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            const rawFloatData = e.inputBuffer.getChannelData(0);
             const base64PCM = pcmToBase64(rawFloatData);
             wsRef.current.send(JSON.stringify({ type: 'audio', data: base64PCM }));
           }
@@ -636,6 +801,13 @@ export default function VerifiPage() {
           handleDisconnectOrFailure(`Audio processing exception: ${audioErr.message || String(audioErr)}`);
         }
       };
+
+      // Drive the on-screen meter at ~30fps from the RMS ref
+      if (meterTimerRef.current) clearInterval(meterTimerRef.current);
+      meterTimerRef.current = setInterval(() => {
+        setAudioLevel(rmsRef.current);
+        setIsSpeaking(Date.now() - lastSpeechTsRef.current < 300);
+      }, 33);
 
       // 3. Initiate WebSocket connection
       connectWebSocket();
@@ -672,6 +844,15 @@ export default function VerifiPage() {
       reconnectTimeoutRef.current = null;
     }
     retryCountRef.current = 0;
+
+    // Stop the audio meter
+    if (meterTimerRef.current) {
+      clearInterval(meterTimerRef.current);
+      meterTimerRef.current = null;
+    }
+    rmsRef.current = 0;
+    setAudioLevel(0);
+    setIsSpeaking(false);
 
     // Stop all media tracks (camera & microphone)
     if (streamRef.current) {
@@ -734,7 +915,7 @@ export default function VerifiPage() {
     }
     addLog("Session closed. Final transcript retained on-screen.", 'success');
     if (sentenceBufferRef.current?.trim()) processSentenceBuffer(true);
-    if (transcript.trim()) computeFounderScore();
+    scheduleFounderScore();
   }
 
   // Toggle Camera
@@ -767,8 +948,14 @@ export default function VerifiPage() {
     setVerifications({});
     autoVerifyCountRef.current = 0;
     verifyQueueRef.current = [];
+    classifyQueueRef.current = [];
     setFounderScore(null);
     setIsScoreModalOpen(false);
+    setDetailClaimId(null);
+    if (scoreWaitTimerRef.current) {
+      clearInterval(scoreWaitTimerRef.current);
+      scoreWaitTimerRef.current = null;
+    }
     console.log("[Verifi ClaimFilter] Claims cleared.");
     addLog("Transcript and claims cleared.", 'info');
   };
@@ -820,7 +1007,11 @@ export default function VerifiPage() {
         <div className="lg:col-span-7 flex flex-col gap-5">
           
           {/* Live Feed Preview Arena */}
-          <div className="flex-1 bg-slate-900 rounded-xl border border-slate-800 relative overflow-hidden flex flex-col justify-between shadow-2xl p-5 min-h-[320px] aspect-video">
+          <div className={`flex-1 bg-slate-900 rounded-xl border relative overflow-hidden flex flex-col justify-between shadow-2xl p-5 min-h-[320px] aspect-video transition-all duration-300 ${
+            isSpeaking
+              ? 'border-indigo-500/70 ring-2 ring-indigo-500/40 shadow-[0_0_28px_rgba(99,102,241,0.35)]'
+              : 'border-slate-800'
+          }`}>
             {/* Camera Simulation Radial Gradient Overlay */}
             <div className="absolute inset-0 opacity-50 bg-[radial-gradient(circle_at_center,_transparent_0%,_black_100%)] pointer-events-none"></div>
             
@@ -877,13 +1068,20 @@ export default function VerifiPage() {
               </div>
             )}
 
-            {/* Audio Level Indicator Overlay (Simulated/Geometric Accents) */}
+            {/* Audio Level Indicator Overlay (driven by real mic RMS) */}
             <div className="z-10 w-full flex items-end gap-1.5 h-6 mt-auto">
-              <div className={`flex-1 rounded-full transition-all duration-300 bg-indigo-500/20 ${isSessionActive ? 'h-3 bg-indigo-400/80' : 'h-1'}`} />
-              <div className={`flex-1 rounded-full transition-all duration-300 bg-indigo-500/20 ${isSessionActive ? 'h-5 bg-indigo-400/80 delay-75 animate-pulse' : 'h-1'}`} />
-              <div className={`flex-1 rounded-full transition-all duration-300 bg-indigo-500/20 ${isSessionActive ? 'h-2 bg-indigo-400/80 delay-100' : 'h-1'}`} />
-              <div className={`flex-1 rounded-full transition-all duration-300 bg-indigo-500/20 ${isSessionActive ? 'h-4 bg-indigo-400/80 delay-150 animate-pulse' : 'h-1'}`} />
-              <div className={`flex-1 rounded-full transition-all duration-300 bg-indigo-500/20 ${isSessionActive ? 'h-1.5 bg-indigo-400/80' : 'h-1'}`} />
+              {[1.4, 2.2, 1.0, 1.8, 0.8].map((mult, idx) => {
+                const px = isSessionActive
+                  ? Math.max(4, Math.min(24, 4 + audioLevel * 260 * mult))
+                  : 4;
+                return (
+                  <div
+                    key={idx}
+                    className={`flex-1 rounded-full transition-[height] duration-75 ${isSessionActive ? 'bg-indigo-400/80' : 'bg-indigo-500/20'}`}
+                    style={{ height: `${px}px` }}
+                  />
+                );
+              })}
             </div>
           </div>
           
@@ -983,21 +1181,31 @@ export default function VerifiPage() {
                 </p>
               ) : (
                 <div className="space-y-3">
-                  {sentences.map((item) => (
+                  {sentences.map((item) => {
+                    const rowVerification = verifications[item.id];
+                    const rowClickable = !!rowVerification && rowVerification.verdict !== 'pending';
+                    return (
                     <motion.div
                       key={item.id}
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
+                      onClick={() => { if (rowClickable) setDetailClaimId(item.id); }}
                       className={`p-3 rounded-lg border flex flex-col sm:flex-row sm:items-start gap-3 transition-colors ${
-                        item.isCheckable 
-                          ? 'bg-amber-50/40 border-amber-100 hover:bg-amber-50/70' 
+                        rowClickable ? 'cursor-pointer' : ''
+                      } ${
+                        item.isCheckable
+                          ? 'bg-amber-50/40 border-amber-100 hover:bg-amber-50/70'
                           : 'bg-slate-50/30 border-slate-100/70 hover:bg-slate-50/70'
                       }`}
                       id={`sentence-card-${item.id}`}
                     >
                       {/* Left Badge Indicator */}
                       <div className="shrink-0 flex flex-wrap gap-1.5 items-center sm:flex-col sm:items-start">
-                        {item.isCheckable ? (
+                        {item.classification === 'classifying' ? (
+                          <span className="inline-flex items-center gap-1 text-[9px] font-medium tracking-wider uppercase px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 border border-slate-200 animate-pulse">
+                            ...
+                          </span>
+                        ) : item.isCheckable ? (
                           <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
                             <Sparkles className="w-2.5 h-2.5" />
                             CHECK
@@ -1050,6 +1258,14 @@ export default function VerifiPage() {
                             );
                           }
 
+                          if (v.verdict === 'mixed') {
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300">
+                                MIXED {Math.round(v.confidence * 100)}%
+                              </span>
+                            );
+                          }
+
                           if (v.verdict === 'unverifiable') {
                             return (
                               <span className="inline-flex items-center gap-1 text-[9px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
@@ -1070,65 +1286,16 @@ export default function VerifiPage() {
                         })()}
                       </div>
                       
-                      {/* Sentence text and optional expanded verification details */}
-                      <div className="flex-1 flex flex-col gap-2">
-                        <div className="text-sm font-normal text-slate-700 leading-relaxed break-words flex items-start justify-between gap-2">
-                          <span className="flex-1">{item.sentence}</span>
-                          {item.isCheckable && verifications[item.id] && verifications[item.id].verdict !== 'pending' && (
-                            <button
-                              onClick={() => toggleExpand(item.id)}
-                              className="p-1 hover:bg-slate-100 rounded-md transition-colors shrink-0 cursor-pointer"
-                              title="Toggle verification details"
-                            >
-                              {expandedClaims[item.id] ? (
-                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
-                              ) : (
-                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
-                              )}
-                            </button>
-                          )}
-                        </div>
-
-                        {/* Details area */}
-                        {item.isCheckable && verifications[item.id] && verifications[item.id].verdict !== 'pending' && expandedClaims[item.id] && (() => {
-                          const v = verifications[item.id];
-                          return (
-                            <motion.div
-                              initial={{ opacity: 0, height: 0 }}
-                              animate={{ opacity: 1, height: 'auto' }}
-                              className="mt-2 text-xs border-t border-slate-100 pt-2.5 text-slate-600 flex flex-col gap-2"
-                            >
-                              {v.evidence && (
-                                <p className="leading-relaxed bg-slate-50 p-2 rounded-md border border-slate-100">
-                                  <span className="font-bold text-slate-700">Evidence: </span>
-                                  {v.evidence}
-                                </p>
-                              )}
-                              {v.sources && v.sources.length > 0 && (
-                                <div className="flex flex-col gap-1">
-                                  <span className="font-bold text-slate-700">Sources:</span>
-                                  <div className="flex flex-wrap gap-1.5 mt-1">
-                                    {v.sources.map((src, idx) => (
-                                      <a
-                                        key={idx}
-                                        href={src.url}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[10px] text-indigo-700 hover:bg-indigo-100 transition-colors"
-                                      >
-                                        <ExternalLink className="w-2.5 h-2.5" />
-                                        <span className="max-w-[120px] truncate">{src.title}</span>
-                                      </a>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-                            </motion.div>
-                          );
-                        })()}
+                      {/* Sentence text; click the row for full verification details */}
+                      <div className="flex-1 flex items-start justify-between gap-2">
+                        <span className="text-sm font-normal text-slate-700 leading-relaxed break-words flex-1">{item.sentence}</span>
+                        {rowClickable && (
+                          <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-1 -rotate-90" />
+                        )}
                       </div>
                     </motion.div>
-                  ))}
+                    );
+                  })}
                   <div ref={sentencesEndRef} />
                 </div>
               )}
@@ -1218,6 +1385,7 @@ export default function VerifiPage() {
                                   <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
                                     trail.verdict?.toLowerCase() === 'supported' ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' :
                                     trail.verdict?.toLowerCase() === 'contradicted' ? 'bg-rose-50 text-rose-700 border border-rose-100' :
+                                    trail.verdict?.toLowerCase() === 'mixed' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
                                     'bg-slate-50 text-slate-600 border border-slate-100'
                                   }`}>
                                     {trail.verdict}
@@ -1328,11 +1496,143 @@ export default function VerifiPage() {
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Input Device</span>
             <span className="text-xs font-bold text-slate-600 mt-0.5">Default Studio Microphone</span>
           </div>
-          <div className="w-9 h-9 bg-slate-50 rounded-full flex items-center justify-center text-slate-400 border border-slate-200 shadow-2xs">
-            <Mic className="w-4 h-4 text-slate-500" />
+          <div className={`w-9 h-9 rounded-full flex items-center justify-center border shadow-2xs transition-all duration-300 ${
+            isSpeaking
+              ? 'bg-indigo-50 border-indigo-300 ring-2 ring-indigo-200 animate-pulse'
+              : 'bg-slate-50 border-slate-200'
+          }`}>
+            <Mic className={`w-4 h-4 transition-colors duration-300 ${isSpeaking ? 'text-indigo-600' : 'text-slate-500'}`} />
           </div>
         </div>
       </footer>
+
+      {/* Claim Verification Detail Modal */}
+      <AnimatePresence>
+        {detailClaimId && (() => {
+          const item = sentences.find(s => s.id === detailClaimId);
+          const v = verifications[detailClaimId];
+          if (!item || !v) return null;
+          const verdictChip =
+            v.verdict === 'supported' ? { label: 'SUPPORTED', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' } :
+            v.verdict === 'contradicted' ? { label: 'CONTRADICTED', cls: 'bg-rose-100 text-rose-800 border-rose-200' } :
+            v.verdict === 'mixed' ? { label: 'MIXED', cls: 'bg-amber-100 text-amber-800 border-amber-300' } :
+            v.verdict === 'error' ? { label: 'ERROR', cls: 'bg-transparent text-rose-700 border-rose-300' } :
+            { label: 'UNVERIFIED', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
+          return (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-slate-950/60 backdrop-blur-sm"
+              onClick={() => setDetailClaimId(null)}
+            >
+              <motion.div
+                initial={{ scale: 0.95, opacity: 0, y: 15 }}
+                animate={{ scale: 1, opacity: 1, y: 0 }}
+                exit={{ scale: 0.95, opacity: 0, y: 15 }}
+                transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+                className="relative w-full max-w-xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden max-h-[85vh] flex flex-col text-slate-800"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Header */}
+                <div className="h-16 border-b border-slate-100 flex items-center justify-between px-6 shrink-0 bg-slate-50">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center shadow-3xs">
+                      <Sparkles className="w-4.5 h-4.5 text-indigo-600" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800">Claim Verification</h3>
+                      <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Grounded via Google Search</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setDetailClaimId(null)}
+                    className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 overflow-y-auto p-6 space-y-5">
+                  {/* Claim */}
+                  <blockquote className="text-sm font-medium text-slate-800 leading-relaxed border-l-4 border-indigo-200 pl-4 py-1 italic">
+                    &ldquo;{item.sentence}&rdquo;
+                  </blockquote>
+
+                  {/* Verdict + confidence */}
+                  <div className="flex items-center gap-3">
+                    <span className={`inline-flex items-center gap-1 text-[10px] font-bold tracking-wider uppercase px-3 py-1 rounded-full border ${verdictChip.cls}`}>
+                      {verdictChip.label}
+                    </span>
+                    <span className="text-xs text-slate-500 font-semibold">
+                      Confidence: {Math.round(v.confidence * 100)}%
+                    </span>
+                  </div>
+
+                  {/* Reasoning */}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                      <HelpCircle className="w-3.5 h-3.5" />
+                      Why this verdict?
+                    </h4>
+                    <p className="text-sm text-slate-600 leading-relaxed bg-slate-50 p-4 rounded-xl border border-slate-100">
+                      {v.evidence || 'No reasoning was returned for this claim.'}
+                    </p>
+                  </div>
+
+                  {/* Sources */}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      Sources
+                    </h4>
+                    {v.sources && v.sources.length > 0 ? (
+                      <div className="flex flex-col gap-1.5">
+                        {v.sources.map((src, idx) => (
+                          <a
+                            key={idx}
+                            href={src.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-50 border border-indigo-100 text-xs text-indigo-700 hover:bg-indigo-100 transition-colors"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">{src.title}</span>
+                          </a>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-400 italic">No web sources returned</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Footer */}
+                <div className="h-16 border-t border-slate-100 flex items-center justify-end gap-3 px-6 shrink-0 bg-slate-50">
+                  {['unverifiable', 'mixed', 'error'].includes(v.verdict) && (
+                    <button
+                      onClick={() => {
+                        requestVerification(item.id, item.sentence, true);
+                        setDetailClaimId(null);
+                      }}
+                      className="px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold rounded-lg border border-indigo-100 transition-colors cursor-pointer"
+                    >
+                      Verify Again
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setDetailClaimId(null)}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer"
+                  >
+                    Close
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          );
+        })()}
+      </AnimatePresence>
 
       {/* Founder Score Modal overlay */}
       <AnimatePresence>
@@ -1460,6 +1760,7 @@ export default function VerifiPage() {
                                 <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase whitespace-nowrap shrink-0 ${
                                   trail.verdict?.toLowerCase() === 'supported' ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' :
                                   trail.verdict?.toLowerCase() === 'contradicted' ? 'bg-rose-50 text-rose-700 border border-rose-100' :
+                                  trail.verdict?.toLowerCase() === 'mixed' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
                                   'bg-slate-50 text-slate-600 border border-slate-100'
                                 }`}>
                                   {trail.verdict}
