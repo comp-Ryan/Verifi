@@ -1,0 +1,60 @@
+[33mcommit 3e1305f08dedd6fe155b698e3ae72788cdc1979e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Ryan <51295899+comp-Ryan@users.noreply.github.com>
+Date:   Sun Jul 19 12:14:03 2026 -0700
+
+    Fixed internal server error - need to fix websocket issue now
+
+[1mdiff --git a/next.config.ts b/next.config.ts[m
+[1mindex 64436cf..12fd984 100644[m
+[1m--- a/next.config.ts[m
+[1m+++ b/next.config.ts[m
+[36m@@ -19,7 +19,6 @@[m [mconst nextConfig: NextConfig = {[m
+       },[m
+     ],[m
+   },[m
+[31m-  output: 'standalone',[m
+   transpilePackages: ['motion'],[m
+   webpack: (config, {dev}) => {[m
+     // HMR is disabled in AI Studio via DISABLE_HMR env var.[m
+[1mdiff --git a/server.ts b/server.ts[m
+[1mindex 113f1b8..0b8cac1 100644[m
+[1m--- a/server.ts[m
+[1m+++ b/server.ts[m
+[36m@@ -220,21 +220,26 @@[m [mapp.prepare().then(() => {[m
+       });[m
+     };[m
+ [m
+[31m-    // Try starting with primary model[m
+[32m+[m[32m    // Try starting with primary model and fallback to exp model if it fails immediately[m
+     try {[m
+[31m-      await connectSession("gemini-3.1-flash-live-preview");[m
+[32m+[m[32m      await connectSession("gemini-2.0-flash");[m
+     } catch (err: any) {[m
+[31m-      console.error("[Live API] Failed to connect to Gemini Live session using primary model:", err);[m
+[31m-      safeSend({ [m
+[31m-        type: "error", [m
+[31m-        error: `Failed to connect with primary model gemini-3.1-flash-live-preview. Error: ${err.message || err}`[m
+[31m-      });[m
+[32m+[m[32m      console.warn("[Live API] Primary model (gemini-2.0-flash) failed. Attempting fallback (gemini-2.0-flash-exp)...", err);[m
+       try {[m
+[31m-        clientWs.close();[m
+[31m-      } catch (wsCloseErr) {[m
+[31m-        console.error("[Live API] Error closing client ws after failed connection:", wsCloseErr);[m
+[32m+[m[32m        await connectSession("gemini-2.0-flash-exp");[m
+[32m+[m[32m      } catch (fallbackErr: any) {[m
+[32m+[m[32m        console.error("[Live API] Fallback model also failed to connect:", fallbackErr);[m
+[32m+[m[32m        safeSend({[m[41m [m
+[32m+[m[32m          type: "error",[m[41m [m
+[32m+[m[32m          error: `Failed to connect with both primary and fallback models. Primary error: ${err.message || err}. Fallback error: ${fallbackErr.message || fallbackErr}`[m
+[32m+[m[32m        });[m
+[32m+[m[32m        try {[m
+[32m+[m[32m          clientWs.close();[m
+[32m+[m[32m        } catch (wsCloseErr) {[m
+[32m+[m[32m          console.error("[Live API] Error closing client ws after failed connection:", wsCloseErr);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        return;[m
+       }[m
+[31m-      return;[m
+     }[m
+ [m
+     clientWs.on("error", (wsErr) => {[m
