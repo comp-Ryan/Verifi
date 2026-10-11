@@ -18,6 +18,15 @@
   <img alt="Tailwind CSS 4" src="https://img.shields.io/badge/Tailwind-4-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white">
 </p>
 
+<p align="center"><b>Contributors</b></p>
+<div align="center">
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/comp-Ryan"><img src="https://github.com/comp-Ryan.png?size=120" width="72" height="72" alt="Ryan"></a><br/><sub><b>Ryan</b></sub><br/><sub><a href="https://github.com/comp-Ryan">@comp-Ryan</a></sub></td>
+  </tr>
+</table>
+</div>
+
 A live diligence assistant for founder pitches. Built for the Stanford x DeepMind hackathon. Verifi listens to a pitch in real time, transcribes it, flags factual claims worth checking, verifies them against the web, and produces an investor-style score when the session ends.
 
 ![Verifi live session — video feed, live transcript, and claim filter with verification badges](assets/screenshot.png)
